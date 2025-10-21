@@ -1,24 +1,11 @@
-# OpenQMD — 3×3 Coupled Phase Motor Prototype
+# motor_3x3_coupled
 
-## Overview
-This module documents the experimental implementation of a DE4-based Quantum Motor Driver (QMD) using a 3×3 coupled-phase axial motor.
-The system explores how Dynamic Equilibrium (DE4) field relationships manifest in real electromechanical hardware.
+This module provides the base structure for the 3×3 coupled motor simulation used in the OpenQMD project.
+It includes the DE4 surrogate model integration and placeholder modules for control, design, and results.
 
 ## Structure
-- design/ — mechanical, electromagnetic, and PCB design files
-- firmware/ — embedded control for stator and rotor inverters
-- simulation/ — Python and Jupyter tools for DE4–QMD surrogate control
-- results/ — validation data, fidelity metrics, and post-run visualizations
-
-## Objectives
-- Demonstrate DE4-derived control in a six-phase, ternary-state configuration
-- Validate surrogate MPC performance under physical constraints
-- Measure coupling factor (k), torque-per-amp, and constructive field stability
-
-## Status
-Preliminary surrogate validation complete (correlation 0.56–0.68 across observables).
-Hardware construction underway. FEM and bench tests to follow.
-
-## Repository
-This prototype is part of the OpenQMD Project.
-All data, models, and control software are released under an open license for collaborative research.
+- `design/` — CAD models, geometry data
+- `firmware/` — embedded controller prototypes
+- `simulation/` — MPC and surrogate tests
+- `results/` — experimental and surrogate validation results
+- `utils/` — shared analysis utilities
