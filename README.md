@@ -1,11 +1,8 @@
-# motor_3x3_coupled
+# Motor 3x3 Coupled & QMD Project
 
-This module provides the base structure for the 3×3 coupled motor simulation used in the OpenQMD project.
-It includes the DE4 surrogate model integration and placeholder modules for control, design, and results.
+This archive contains DE4 surrogate and coupled motor simulation results for QMD validation.
 
-## Structure
-- `design/` — CAD models, geometry data
-- `firmware/` — embedded controller prototypes
-- `simulation/` — MPC and surrogate tests
-- `results/` — experimental and surrogate validation results
-- `utils/` — shared analysis utilities
+Folders:
+- `simulation/`: DE4 surrogate outputs
+- `results/`: DE4 paper datasets and residual spectra
+- `notebooks/`: related Colab notebooks
