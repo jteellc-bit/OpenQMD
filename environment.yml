@@ -1,0 +1,13 @@
+name: qmd_surrogate
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - matplotlib
+  - scikit-learn
+  - jupyter
+  - pip
+  - pip:
+    - tqdm
+    - google-auth
+    - google-auth-oauthlib

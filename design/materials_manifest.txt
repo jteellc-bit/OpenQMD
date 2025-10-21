@@ -1,0 +1,6 @@
+# Materials Manifest
+- Rotor core: laminated soft magnetic alloy
+- Stator: dual PCB copper windings (0.3 mm trace, 2 oz copper)
+- Bearings: low-friction ceramic hybrid
+- Inverter: 3-phase H-bridge (MOSFET 40V, 10A)
+- Controller: STM32F407 + isolated CAN transceiver
