@@ -7,7 +7,7 @@
 |------|--------------|
 | `singlecoil_lambda_scan.py` | Single-coil reference model for baseline Λₗ efficiency mapping. |
 | `triplegrid_lambda_scan.py` | Three-grid interaction model with coherence analysis. |
-| `ff_turbine_simulation.py` | Feed-forward turbine surrogate model testing multi-stage response. |
+| `ff_turbine_simulation.py` | ferrofluid turbine surrogate model testing multi-stage response. |
 
 ## Run Commands
 ```bash
