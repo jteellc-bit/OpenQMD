@@ -1,26 +1,35 @@
-# OpenQMD — Simulation Suite  
-**Directory:** `/OpenQMD/simulations/`  
-**Purpose:** Numerical exploration of efficiency and collective response behaviors under varying λₗ (Lambda-collective) and dynamic load conditions.
+# OpenQMD Documentation Bundle
+
+This directory contains the consolidated documentation set for OpenQMD Phase II (October 2025).  
+It integrates both internal technical insights and external-facing motor/generator applicability reports.
+
+---
 
 ## Contents
-| File | Description |
-|------|--------------|
-| `singlecoil_lambda_scan.py` | Single-coil reference model for baseline Λₗ efficiency mapping. |
-| `triplegrid_lambda_scan.py` | Three-grid interaction model with coherence analysis. |
-| `ff_turbine_simulation.py` | ferrofluid turbine surrogate model testing multi-stage response. |
 
-## Run Commands
+| File | Purpose |
+|------|----------|
+| **OpenQMD_Internal_Memo.md** | Internal coordination summary covering DE2→DE4→QMD development, deliverable tracking, and testing status. |
+| **QMD_Motor_Generator_Applicability.md** | External-ready documentation showing how QMD applies to motor/generator and turbine architectures. |
+
+---
+
+## Usage Notes
+These documents are Markdown-native and directly viewable on GitHub.  
+They serve as the reference documentation layer for all simulations under `/OpenQMD/simulations/`.
+
+If editing locally:
 ```bash
-python3 singlecoil_lambda_scan.py
-python3 triplegrid_lambda_scan.py
-python3 ff_turbine_simulation.py
+cd OpenQMD/docs
+code OpenQMD_Internal_Memo.md
+code QMD_Motor_Generator_Applicability.md
 ```
 
-## Output Files
-| Script | Output CSV | Columns |
-|--------|-------------|----------|
-| `singlecoil_lambda_scan.py` | `singlecoil_summary_table.csv` | lambda_L, mean_efficiency, std_efficiency, torque_rms |
-| `triplegrid_lambda_scan.py` | `triplegrid_summary.csv` | lambda_L, mean_eff, std_eff, mean_coherence |
-| `ff_turbine_simulation.py` | `ff_turbine_summary.csv` | lambda_L, rpm, stages, efficiency, elec_output |
+Commit using:
+```bash
+git add .
+git commit -m "Add DE2→DE4→QMD insight memo and motor/generator documentation"
+git push origin main
+```
 
-© OpenQMD Research Group — Simulation Infrastructure (Deliverable 1, DE2 → DE4 → QMD Series)
+---
