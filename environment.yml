@@ -1,10 +1,13 @@
-name: openqmd-singlecoil
+name: qmd_surrogate
 dependencies:
   - python=3.10
+  - numpy
+  - pandas
+  - matplotlib
+  - scikit-learn
+  - jupyter
   - pip
   - pip:
-    - torch
-    - numpy
-    - matplotlib
-    - pandas
-    - ipywidgets
+    - tqdm
+    - google-auth
+    - google-auth-oauthlib

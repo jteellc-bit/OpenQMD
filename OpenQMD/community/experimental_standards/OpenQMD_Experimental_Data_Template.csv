@@ -1,0 +1,2 @@
+experiment_id,contributor,date,system_type,sensor_type,input_power_W,output_power_W,coherence_index,notes
+QMD001,jt,2025-10-20,motor-prototype-A,Hall sensor,100,118,0.935,initial QMD test run
