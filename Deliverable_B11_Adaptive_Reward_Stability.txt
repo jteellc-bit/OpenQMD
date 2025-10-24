@@ -1,0 +1,3 @@
+Deliverable B11 - Adaptive-Reward Stability
+
+Summary: volatility-aware reward scaling and policy damping. Replace with full text.

@@ -1,0 +1,4 @@
+Spintronic mapping summary for QMD (brief):
+- QMD state -> spin/p-bit analogue
+- Residual head -> local correction
+- Policy net -> external bias field
