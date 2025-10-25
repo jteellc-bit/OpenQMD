@@ -1,0 +1,17 @@
+Placeholder for MISSING_FILES_MANIFEST.txt — to be replaced with real content.
+=== OpenQMD Missing Files Manifest ===
+DE5_Fractal_Unification_Framework/README.md
+DE5_Fractal_Unification_Framework/DE5_Framework_Overview.md
+DE5_Fractal_Unification_Framework/Fractal_Unification_Theory.pdf
+DE5_Fractal_Unification_Framework/src/de5_core.py
+DE5_Fractal_Unification_Framework/src/de5_transformations.py
+DE5_Fractal_Unification_Framework/src/de5_visualization.py
+DE5_Fractal_Unification_Framework/notebooks/DE5_Simulation_Demo.ipynb
+DE5_Fractal_Unification_Framework/data/sample_inputs/config_example.json
+DE5_Fractal_Unification_Framework/docs/Conceptual_Map.png
+QMD_Global_Efficiency/QMD_Global_Efficiency_v2.py
+QMD_Global_Efficiency/QMD_System_Scale_Simulation.ipynb
+QMD_Global_Efficiency/trained_models/qmd_model_3output.pkl
+QMD_Global_Efficiency/outputs/system_scale_results/run_config_example.json
+meta/MISSING_FILES_MANIFEST.txt
+meta/PROJECT_REBUILD_GUIDE.md

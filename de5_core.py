@@ -1,3 +1,1 @@
-import numpy as np
-def phi_operator(Lambda, Psi, f):
-    return np.trapz(np.trapz(f(Lambda, Psi), Lambda), Psi)
+Placeholder for src/de5_core.py — to be replaced with real content.
