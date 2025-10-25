@@ -1,0 +1,30 @@
+DE5 MASTER REPORT PACKAGE
+Generated: 2025-10-25 13:30:26
+
+=== CORE ASSUMPTIONS ===
+Total Primary Energy (2026 est): 30,000 TWh/year
+Fossil Fuel Share: 82% (24,600 TWh/year)
+Electric Cost Basis: $0.12/kWh
+
+=== INCLUDED FILES ===
+1. DE5_Global_Conservative.csv
+2. DE5_Global_Enhanced.csv
+3. DE5_Global_Aggressive.csv
+4. DE5_1x1_Motor_Iteration_Summary.csv
+5. DE5_Per_Scale_Metrics.csv
+
+=== INTERPRETATION ===
+- DE5 coherence operates across both supply and demand domains.
+- Conservative → 21% fossil reduction by Year 15.
+- Enhanced → 36% fossil reduction, ~1T USD savings.
+- Aggressive → 82% fossil reduction, ~2.1T USD annual savings, functional oil independence by Year 15.
+
+=== ITERATION SUMMARY (Motor) ===
+Mean inter-scale correlation rises 0.35 → 0.998 by iteration 10.
+Variance increases 0.31 → 1.71.
+Hurst Mean stabilizes ~0.83, indicating fractal coherence.
+MSE Mean 1.18 → 1.70 confirming multi-scale entropy alignment.
+
+=== CONCLUSION ===
+The DE5 framework extends QMD coherence into practical mechanical and energetic domains,
+demonstrating quantitative convergence between local optimization and global energy transition.
