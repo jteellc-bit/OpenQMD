@@ -1,0 +1,190 @@
+1x1 controller 10 (ready-to-run Python desktop serial interface)
+
+below is a **ready-to-run Python desktop serial interface** that works with the STM32 firmware we just built.
+
+It provides both **interactive CLI control** and **real-time telemetry logging** (to CSV), with optional **live plotting** of current and voltage using `matplotlib`.
+You can run it on **Windows, macOS, or Linux** — it uses standard libraries plus `pyserial` and `matplotlib`.
+
+---
+
+## 🐍 `de5_serial_interface.py`
+
+```python
+#!/usr/bin/env python3
+"""
+DE5 / QMD Motor Controller Serial Interface
+-------------------------------------------
+Communicates with STM32 firmware over UART.
+Provides interactive control, data logging, and real-time plotting.
+
+Requirements:
+    pip install pyserial matplotlib
+
+Usage:
+    python de5_serial_interface.py --port /dev/ttyUSB0 --baud 115200
+"""
+
+import serial
+import time
+import csv
+import threading
+import argparse
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from datetime import datetime
+
+running = True
+telemetry_data = []
+
+def read_serial(port, csv_writer):
+    """ Continuously read serial data and log CSV """
+    global running
+    while running:
+        try:
+            line = port.readline().decode(errors="ignore").strip()
+            if not line:
+                continue
+            if "," in line:
+                # Telemetry CSV
+                parts = line.split(",")
+                if len(parts) == 4:
+                    angle, current, vcmd, itgt = map(float, parts)
+                    timestamp = time.time()
+                    csv_writer.writerow([timestamp, angle, current, vcmd, itgt])
+                    telemetry_data.append((timestamp, current, vcmd))
+                    print(f"[DATA] angle={angle:.3f}, I={current:.3f}, V={vcmd:.3f}")
+            else:
+                print(f"[INFO] {line}")
+        except Exception as e:
+            print("Serial read error:", e)
+            break
+
+
+def send_command(port, cmd):
+    """Send a single-character or text command"""
+    if not cmd.endswith("\r"):
+        cmd += "\r"
+    port.write(cmd.encode())
+    time.sleep(0.05)
+
+
+def live_plot():
+    """Live plotting of telemetry (current and voltage)"""
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots()
+    ax.set_title("Real-Time Telemetry (Current / Voltage)")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude")
+
+    line1, = ax.plot([], [], label="Current [A]")
+    line2, = ax.plot([], [], label="Voltage Command [V]")
+    ax.legend()
+
+    def update(_):
+        if not telemetry_data:
+            return line1, line2
+        t0 = telemetry_data[0][0]
+        t = [x[0] - t0 for x in telemetry_data]
+        i = [x[1] for x in telemetry_data]
+        v = [x[2] for x in telemetry_data]
+        line1.set_data(t, i)
+        line2.set_data(t, v)
+        ax.relim()
+        ax.autoscale_view()
+        return line1, line2
+
+    ani = animation.FuncAnimation(fig, update, interval=200)
+    plt.show()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="DE5 / QMD Serial Interface")
+    parser.add_argument("--port", required=True, help="Serial port (e.g. COM3 or /dev/ttyUSB0)")
+    parser.add_argument("--baud", default=115200, type=int, help="Baud rate")
+    parser.add_argument("--log", default=None, help="Output CSV log file (default timestamped)")
+    parser.add_argument("--plot", action="store_true", help="Enable live plotting")
+    args = parser.parse_args()
+
+    csv_filename = args.log or f"de5_telemetry_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    port = serial.Serial(args.port, args.baud, timeout=0.5)
+    print(f"[CONNECTED] {args.port} @ {args.baud} baud")
+
+    # Start logging thread
+    with open(csv_filename, "w", newline="") as f:
+        csv_writer = csv.writer(f)
+        csv_writer.writerow(["timestamp", "rotor_angle", "current", "V_command", "I_target"])
+
+        t = threading.Thread(target=read_serial, args=(port, csv_writer))
+        t.start()
+
+        try:
+            print("\nCommands:")
+            print("  S = start control")
+            print("  P = pause control")
+            print("  T = toggle telemetry")
+            print("  R<n> = select DE5 row (e.g., R1)")
+            print("  Q = query current DE5 values")
+            print("  X = exit\n")
+
+            if args.plot:
+                threading.Thread(target=live_plot, daemon=True).start()
+
+            while True:
+                cmd = input(">> ").strip()
+                if cmd.upper() == "X":
+                    break
+                send_command(port, cmd)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            global running
+            running = False
+            print("\n[DISCONNECTED]")
+            port.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 💻 Features
+
+| Function                 | Description                                    |
+| ------------------------ | ---------------------------------------------- |
+| **Start/Pause (S/P)**    | Toggles the control loop on the MCU            |
+| **Toggle Telemetry (T)** | Starts/stops CSV streaming from STM32          |
+| **Switch Row (R<n>)**    | Selects DE5 parameter row                      |
+| **Query (Q)**            | Displays current DE5 values                    |
+| **Live Plot (--plot)**   | Optional real-time plot of current and voltage |
+| **CSV Logging (--log)**  | Saves all telemetry to a timestamped file      |
+
+---
+
+### 🧪 Example Usage
+
+```bash
+python de5_serial_interface.py --port /dev/ttyUSB0 --baud 115200 --plot
+```
+
+Example session:
+
+```
+[CONNECTED] /dev/ttyUSB0 @ 115200 baud
+Commands:
+  S = start control
+  P = pause control
+  T = toggle telemetry
+  R<n> = select DE5 row (e.g., R1)
+  Q = query current DE5 values
+  X = exit
+
+>> S
+[INFO] CONTROL START
+>> T
+[DATA] angle=0.000, I=0.102, V=0.115
+[DATA] angle=0.050, I=0.106, V=0.118
+...
+```
+
+---
