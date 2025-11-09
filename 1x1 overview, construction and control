@@ -1,0 +1,139 @@
+1x1 overview, construction and control
+
+Below I give a detailed, production-oriented overview of how to wire and control the 1×1 QMD motor using the H-bridge strategy you describe, plus concrete engineering notes (safety, EMI, sensors, saturation handling, PWM strategy, prototyping steps, and suggested starting constants). Treat this as the actionable “recipe” for the control subsystem and first bench prototypes.
+
+1. Hardware topology (wiring & H-bridges)
+Summary: two stator coils in parallel (stator-left, stator-right), two rotor coils in parallel (rotor-left, rotor-right). Each coil-pair (stator pair and rotor pair) is flipped as a unit using an H-bridge. Optionally add a third H-bridge to separately control the two outer stator coils for extra control authority.
+Minimum H-bridge count:
+    • 2 × H-bridges — one per coil-pair (stator-pair and rotor-pair).
+    • Optional 3rd H-bridge — splits stator pair into two independently switched coil groups (gives finer spatio-temporal control at cost of extra switching losses/complexity).
+Recommended wiring:
+    • Stator coils: physically two coils, electrically paralleled (or left as separate channels if adding 3rd H-bridge). Paralleling requires matched resistance/inductance and a current-sharing scheme (see below).
+    • Rotor coils: leave physically as two coils but wire them in parallel and drive only as one channel (avoid trying to independently switch rotor coils because of EMI, coupling, and practical routing constraints).
+    • Wireless Tx/Rx central coil pair remains separate — driven by a resonant wireless power transmitter (full-bridge or half-bridge resonant driver), not by the H-bridges used for the main coils.
+Important: all H-bridges must be referenced to the same DC bus (battery/inverter) but ensure proper isolation for sensing (isolated shunts or isolated current sensors for rotor current measurement).
+
+2. Why this is a good minimal architecture
+    • Simplicity: 2 H-bridges is the simplest way to achieve full polarity reversal for both primary field sources.
+    • Functionally sufficient: QMD’s control objective (flip polarity to constructively align fields and forbid destructive paths) only requires the ability to flip polarity and vary current. Independent phase shaping is secondary.
+    • Reliability & EMI: fewer independent switching nodes reduces EMI and keeps the wireless coupling plane stable.
+    • Scalability: adding a third H-bridge later for stator-splitting is straightforward if more control authority is needed.
+
+3. Practical circuit suggestions (components & protection)
+    • H-bridge MOSFETs: low Rds(on) MOSFETs or SiC MOSFETs depending on target voltage. Choose devices rated ≥ 1.5× your max DC link voltage and ≥ 1.5× peak current. For EV-scale experiments consider 150–650 V SiC if using high voltage; for bench 48–96 V, use automotive MOSFETs rated for >150 V and high current (e.g., 100–400 A capability in parallel).
+    • Gate drivers: isolated gate drivers or gate drivers with proper level shifting. Include desaturation and overcurrent detection.
+    • Current sensing: low-ohm shunt + isolated amplifier or Hall-effect sensors on each H-bridge leg. Shunts for accuracy, Hall sensors for isolation and simplicity.
+    • Snubbers / RC dampers: across MOSFETs to tame dv/dt spikes; plus fast TVS for transient suppression.
+    • DC bus filtering: electrolytic + film capacitors close to H-bridges to handle switching transients.
+    • EMI mitigation: common-mode choke on DC bus, differential chokes on coil lines, and graphite spreader acting as partial shield (grounded appropriately).
+    • Safety: precharge resistor on DC bus, contactor / relay to disconnect in fault, temperature interlocks on coil assemblies.
+
+4. Paralleling coils & current sharing
+If you parallel two identical coils per side:
+    • Ideally match turns, resistance, and geometry. Mismatch → unequal current sharing.
+    • Use small series balancing resistors (milliohm range) if necessary to help equalize currents.
+    • Alternatively, drive physically separate coils from separate H-bridges and actively control currents to match them (more complex).
+Because rotor coils are wirelessly powered and subject to coupling variations, do not attempt per-coil independent switching on the rotor side until you have robust isolation and EMI control.
+
+5. Simple torque/saturation model (for controller)
+Use a low-dimensional saturation model in the real-time controller to avoid commanding currents that push magnetic cores into deep saturation:
+Suggested formula (simple, smooth saturation):
+τ(I) = k_t * I * S(I)
+S(I) = 1 / (1 + (I / I_sat)^α)
+Where:
+    • τ(I) — torque contribution (Nm)
+    • k_t — base torque constant (Nm/A) measured/calibrated
+    • I — commanded coil current (A)
+    • I_sat — saturation current (A) — the scale at which saturation becomes important
+    • α — saturation steepness exponent (typically 1.5–3)
+Suggested starting constants (tunable):
+    • For bench 48–96 V experiments: I_sat = 300 A, α = 2.0
+    • For EV-scale exploration: I_sat = 600–1200 A, α = 2.0–3.0
+These are starting values. You should calibrate k_t and I_sat experimentally for your coil geometry (static bench test measuring torque vs current using a torque sensor). The S(I) term smoothly reduces torque growth as current approaches saturation.
+Controller should clamp I_command so that (I_command / I_sat) < safety_limit (e.g., 1.1) and monitor coil temperature.
+
+6. Control strategy & software architecture
+High-level loop (QMD solver integrated):
+    1. Sensor read: coil currents, DC bus voltage, rotor speed (encoder), coil temp, Tx/Rx coupling efficiency, back-EMF if measurable.
+    2. QMD solve (fast approximation): compute desired constructive field pattern → yields desired polarity state and target current magnitudes for stator and rotor coil pairs. (This is your DE5-driven decision.)
+    3. Saturation check: apply τ(I) model and clamp I to avoid deep saturation; compute expected torque contribution.
+    4. State update: set H-bridge outputs (polarity + PWM duty for current level).
+    5. Protection & adaptation: if current limit hit, adjust polarity timing to preserve constructive interference strategy (e.g., shorter on times but higher frequency switching).
+    6. Loop: iterate at control rate (≥ 1 kHz; ideally 5–10 kHz for fine control and current loop stability).
+Low-level implementation notes:
+    • Use current control loops (inner loop PI/PI) running at high frequency (8–20 kHz), with outer QMD command loop at slower rate (1–200 Hz depending on computational load).
+    • For polarity flips, coordinate with PWM cycle boundaries and provide safe dead-time. Avoid hard synchronous flips at arbitrary instants — use a commutation window where current is momentarily reduced to avoid large voltage spikes.
+    • If you add the 3rd H-bridge to split stator coils, QMD can choose between coarse control (both stator halves same) or micro-phasing (slight offset to shape field). Expect extra switching losses; use only if necessary.
+Example simplified pseudocode (controller):
+loop @ 1 kHz:
+    read sensors
+    desired = QMD_solver(state)
+    I_target_stator, polarity_stator = desired.stator_current, desired.stator_polarity
+    I_target_rotor, polarity_rotor   = desired.rotor_current, desired.rotor_polarity
+
+    # apply saturation model
+    I_stator = clamp(I_target_stator, 0, I_max_allowed)
+    I_rotor  = clamp(I_target_rotor,  0, I_max_allowed)
+    torque_est = k_t_stator*I_stator*S(I_stator)+k_t_rotor*I_rotor*S(I_rotor)
+
+    # pass commands to low-level current PI loops
+    set_hbridge_polarity(stator, polarity_stator)
+    set_current_target(stator, I_stator)
+    set_hbridge_polarity(rotor, polarity_rotor)
+    set_current_target(rotor, I_rotor)
+
+    log telemetry, check faults
+
+7. PWM and switching recommendations
+    • Use current-mode PWM for stable current control in inductors.
+    • Keep switching frequency moderate (8–20 kHz) to balance switching losses and control resolution.
+    • Implement dead-time of a few hundred ns to microseconds depending on MOSFET gate drivers.
+    • Use synchronous current measurement sampling (sample current at a fixed phase of PWM) to get stable measurements.
+    • Transitioning polarity: ideally reduce current to near zero (or cross-zero) before flip. If you must flip under load, use an H-bridge safe-commutate sequence with snubbers and slower slope (to limit di/dt).
+
+8. Using coils as sensors (you already suggested this — excellent)
+    • Inject small AC probe (low amplitude) during idle intervals to estimate coil impedance and identify temperature-dependent resistance changes.
+    • Measure back-EMF during short open-circuit windows to estimate rotor position and relative phase without separate encoders (useful but tricky with active wireless coupling).
+    • Use coil resistance vs temperature (R = R0 (1 + αT)) to estimate coil temperature if you cannot mount many sensors. Combine with a small number of thermistors for calibration.
+
+9. Wireless Tx/Rx driver & synchronization
+    • Drive the Tx coil with a resonant full-bridge at the designed resonant frequency (10–50 kHz is reasonable).
+    • Monitor Rx coupling (V_rx / V_tx, phase) to estimate mutual coupling and adjust Tx drive amplitude/frequency for efficiency.
+    • Provide a low-latency link (optical, RF, or wired telemetry through slip-ring during tests) to transmit rotor status to QMD during prototyping. Later rely on back-EMF or wireless telemetry.
+
+10. EMI & shielding best practices
+    • Ground graphite spreader to a single chassis ground point — it can act as a distributed shield.
+    • Use twisted pair / shielded cable for any sensors leaving the rotor/stator assembly.
+    • Use ferrite common-mode chokes on DC and signal lines.
+    • Place snubbers and TVS diodes close to MOSFETs.
+    • Ramp PWM transitions when flipping polarity to reduce dv/dt.
+    • Avoid fast open-loop flips on rotor coils; let the control opener reduce current first.
+
+11. Thermal & cooling integration recommendations
+    • Use graphite (graphoil) spreaders at the two outer faces to spread heat to fins. Graphite is light, high in-plane conductivity, and works well combined with small heat pipes in critical hot spots (hybrid approach).
+    • Ribbon/foil windings predominantly improve fill factor and reduce AC losses; combine that with graphite to get uniform thermal conduction.
+    • Use wheel-motion-driven fins (or shrouds) for passive forced convection in vehicle applications.
+
+12. Validation & prototyping plan (step-by-step)
+    1. Bench test single H-bridge + single coil: validate current control loop, measure k_t and R(T).
+    2. Add second coil in parallel on same H-bridge: check current sharing; adjust balancing resistors or separate drivers if needed.
+    3. Add rotor coils and wireless Tx/Rx: test wireless power transfer and measure coupling efficiency.
+    4. Implement QMD solver loop offline: compute switching patterns and verify they are implementable in controller timing.
+    5. Integrate full QMD real-time loop on a capable microcontroller/FPGA (control at 1 kHz for QMD decisions, inner loops at 10 kHz).
+    6. Thermal ramp: run continuous operation at moderate current, log temps, refine cooling and thermal model constants.
+    7. Saturation mapping: gradually increase current and record torque vs current, fit k_t and I_sat, update the controller saturation model.
+    8. EMI & safety tests: evaluate emissions and add shielding/chokes as needed.
+    9. Iterate: try 3rd H-bridge on stator if additional phase shaping proves worthwhile.
+
+13. Suggested monitoring & telemetry
+    • DC bus voltage and current.
+    • Per-bridge current (shunt or Hall).
+    • Coil temperature (PT100 or NTC thermistors at multiple locations).
+    • Rotor speed (optical encoder or back-EMF estimate).
+    • Tx/Rx coupling (V, I, phase).
+    • Fault flags (overcurrent, overtemp, undervoltage).
+
+14. Final notes about control philosophy (anti-solution + DE5)
+    • The QMD controller’s primary action is topology choice (which polarity states are allowed) and timing (how long to hold a polarity), not continuous sinusoidal shaping. H-bridges give precisely the binary polarity lever you need.
+    • Saturation handling must be baked into the QMD decision so the solver doesn’t propose currents that cannot produce constructive torque (or that produce destructive saturation artifacts). Use the smooth S(I) term above to bias decisions away from saturating operating points.
+    • Keep telemetry and logging rich at first — the DE5/QMD approach will benefit from empirical calibration of k_t, I_sat, thermal resistance, and coupling coefficients.
