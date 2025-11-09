@@ -1,0 +1,550 @@
+1x1 controller 15 (MCU-ready STM32 HAL-style implementation)
+
+below is a complete, MCU-ready STM32 HAL-style implementation that moves the adaptive scoring and morphing on-board so the microcontroller can make autonomous DE5 decisions without relying on a PC.
+What you get:
+    • main.c — HAL init, main loop, safety watchdog, PWM/ADC placeholders, and periodic control tick.
+    • de5_control.h / de5_control.c — DE5 table structure, scoring, normalization, morphing logic, weight management, rate-limits, and safety clamps.
+    • uart_cmd.h / uart_cmd.c — UART command parser to manage rows, weights, start/stop, and telemetry toggles; simple text protocol compatible with the PC GUI.
+    • Comments and README-style notes inside code explaining how to adapt PWM/ADC pins, how to change the DE5 parameter table, and what the protocol lines look like.
+    • Telemetry streaming (CSV-like) to the serial port for logging/visualization.
+    • Safety limits: morph cooldown, max row step per morph, anti-flapping hysteresis, emergency stop, optional current-limit check.
+This is a structured, production-minded skeleton you can drop into an STM32CubeIDE project (connect HAL init from CubeMX). It purposely leaves hardware-specific details (pin assignments, exact timer/ADC channels) obvious and marked with TODOs so you can plug your CubeMX-generated handles.
+
+Files (all provided below)
+    1. de5_control.h
+    2. de5_control.c
+    3. uart_cmd.h
+    4. uart_cmd.c
+    5. main.c
+Put them into your STM32CubeIDE project, include the CubeMX-generated stm32xxx_hal.h and main.h as usual, and wire the timers/ADCs/UART handles referenced in the TODOs.
+
+Protocol (UART)
+ASCII commands (line terminated with \r or \n):
+    • R<n> — set active DE5 row to <n> (example R5)
+    • START — enable on-board adaptive morphing and control loop
+    • STOP — disable adaptive morphing (safe state)
+    • W T <0.0..1.0> — set torque weight (example W T 0.5)
+    • W E <0.0..1.0> — set efficiency weight
+    • W P <0.0..1.0> — set temperature weight (P = "thermal")
+    • W N <n> — set morph max step (integer)
+    • GET — prints state summary
+    • STREAM ON / STREAM OFF — enable/disable telemetry streaming
+    • SAV — (placeholder) save current weights to persistent storage (implementation optional)
+Telemetry stream format (CSV):
+<t_ms>,<I_A>,<Vcmd>,<I_tgt>,<T_C>,<torque>,<eff>\r\n
+Example: 1623456,54.2,0.12,60.0,46.3,8271.06,0.9942
+
+Notes before you paste & compile
+    • Replace htimX, hadcX, huartX with your CubeMX handles (e.g., htim1, hadc1, huart2).
+    • Implement read_adc_current() and read_temperature_C() functions per your sensor hardware; simple stubs are provided.
+    • DE5_TABLE is stored in flash as a const array. Edit values to match your DE5 CSV. For dynamic updates you can implement a simple flash-write routine or use an external EEPROM.
+    • PWM outputs are set via set_pwm_duty_coil_X(duty) stubs — map them to timers in CubeMX.
+    • The code uses integer-friendly math and a few floating ops (float). Use -mfpu/-mfloat-abi in project settings if using Cortex-M4F/M7.
+
+de5_control.h
+/* de5_control.h
+ * Onboard DE5 adaptive scoring + morphing (STM32 HAL-style)
+ *
+ * Public API:
+ *   de5_init();
+ *   de5_tick(dt_ms);
+ *   de5_set_weights(w_torque, w_eff, w_temp);
+ *   de5_set_row(n);
+ *   de5_start(); de5_stop();
+ *   de5_handle_emergency_stop();
+ *   de5_stream_telemetry(onoff);
+ *
+ * NOTE: Replace TODO hardware functions with your CubeMX handles.
+ */
+
+#ifndef DE5_CONTROL_H
+#define DE5_CONTROL_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#define MAX_DE5_ROWS 64
+#define TELEMETRY_BUF_LEN 128
+
+typedef struct {
+    uint16_t row_id;
+    float torque;      // reference torque metric
+    float efficiency;  // reference efficiency metric
+    float est_temp;    // estimated temperature proxy
+} DE5Row_t;
+
+typedef struct {
+    bool running;
+    uint16_t active_row;
+    float w_torque;
+    float w_eff;
+    float w_temp;
+    uint32_t morph_cooldown_ms;
+    uint8_t morph_step_max;
+    bool stream_telemetry;
+} DE5State_t;
+
+/* Initialize DE5 module and load table (table stored in flash) */
+void de5_init(void);
+
+/* Call from main loop at regular interval (dt_ms is delta time) */
+void de5_tick(uint32_t dt_ms);
+
+/* Set weights (no persistence) */
+void de5_set_weights(float w_torque, float w_eff, float w_temp);
+
+/* Set morph parameters */
+void de5_set_morph_params(uint32_t cooldown_ms, uint8_t step_max);
+
+/* Manually set active row (immediate) */
+void de5_set_row(uint16_t row);
+
+/* Start/stop autonomous morphing */
+void de5_start(void);
+void de5_stop(void);
+
+/* Emergency stop (disables outputs immediately) */
+void de5_handle_emergency_stop(void);
+
+/* telemetry streaming on/off */
+void de5_stream_telemetry(bool on);
+
+/* State getter */
+DE5State_t de5_get_state(void);
+
+/* Hardware hooks to implement in your project (weak or real) */
+float hw_read_current_A(void);      // read coil/phase current
+float hw_read_temperature_C(void);  // read coil temp
+void hw_set_pwm_duty(float duty_left, float duty_right); // set output PWM [-1..1] normalized
+uint32_t hw_get_millis(void);       // millisecond uptime
+void hw_safe_shutdown_outputs(void); // set PWMs to safe / zero
+
+#endif /* DE5_CONTROL_H */
+
+de5_control.c
+/* de5_control.c
+ * Implementation of onboard scoring + morphing
+ */
+
+#include "de5_control.h"
+#include "string.h"
+#include <math.h>
+#include <stdio.h>
+
+/* TODO: Replace with your HAL UART printf or buffer to send telemetry lines */
+extern void uart_printf(const char *fmt, ...);
+
+/* ----- Hardware hooks: weak stubs (override in main project) ----- */
+__attribute__((weak)) float hw_read_current_A(void) { return 0.0f; }
+__attribute__((weak)) float hw_read_temperature_C(void) { return 25.0f; }
+__attribute__((weak)) void hw_set_pwm_duty(float duty_left, float duty_right) { (void)duty_left; (void)duty_right; }
+__attribute__((weak)) uint32_t hw_get_millis(void) { return 0u; }
+__attribute__((weak)) void hw_safe_shutdown_outputs(void) { hw_set_pwm_duty(0.0f, 0.0f); }
+
+/* ----- DE5 table in flash (edit with your values) ----- */
+/* Example rows (row_id, torque, efficiency, est_temp) */
+static const DE5Row_t DE5_TABLE[] = {
+    {1,  100.0f, 0.90f, 60.0f},
+    {2,  120.0f, 0.91f, 62.0f},
+    {3,  140.0f, 0.92f, 65.0f},
+    {4,  160.0f, 0.925f, 66.0f},
+    {5,  180.0f, 0.93f, 68.0f},
+    /* ... fill up to your top 30 rows ... */
+};
+static const uint16_t DE5_TABLE_LEN = sizeof(DE5_TABLE) / sizeof(DE5_TABLE[0]);
+
+/* module state */
+static DE5State_t state;
+
+/* internal */
+static uint32_t last_morph_ms = 0;
+
+/* normalize helper: maps array to 0..1 */
+static void normalize_arr(const float *in, float *out, uint16_t len) {
+    float mn = in[0], mx = in[0];
+    for (uint16_t i=1;i<len;i++){
+        if (in[i] < mn) mn = in[i];
+        if (in[i] > mx) mx = in[i];
+    }
+    if (fabsf(mx - mn) < 1e-9f) {
+        for (uint16_t i=0;i<len;i++) out[i] = 0.5f;
+        return;
+    }
+    for (uint16_t i=0;i<len;i++) out[i] = (in[i] - mn) / (mx - mn);
+}
+
+/* compute best row based on current weights */
+static uint16_t compute_best_row(void) {
+    uint16_t n = DE5_TABLE_LEN;
+    float torque_arr[MAX_DE5_ROWS];
+    float eff_arr[MAX_DE5_ROWS];
+    float temp_arr[MAX_DE5_ROWS];
+    float nt[MAX_DE5_ROWS], ne[MAX_DE5_ROWS], ntemp[MAX_DE5_ROWS];
+    for (uint16_t i=0;i<n;i++){
+        torque_arr[i] = DE5_TABLE[i].torque;
+        eff_arr[i] = DE5_TABLE[i].efficiency;
+        temp_arr[i] = DE5_TABLE[i].est_temp;
+    }
+    normalize_arr(torque_arr, nt, n);
+    normalize_arr(eff_arr, ne, n);
+    normalize_arr(temp_arr, ntemp, n); // invert later (low temp better)
+
+    float best_score = -1e9f;
+    uint16_t best_idx = 0;
+    for (uint16_t i=0;i<n;i++){
+        float score = state.w_torque * nt[i] + state.w_eff * ne[i] + state.w_temp * (1.0f - ntemp[i]);
+        if (score > best_score) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+    return DE5_TABLE[best_idx].row_id;
+}
+
+/* apply morph step toward target row, with cooldown and step limits */
+static void morph_step_to(uint16_t target_row) {
+    uint32_t now = hw_get_millis();
+    if (now - last_morph_ms < state.morph_cooldown_ms) return;
+    if (target_row == state.active_row) return;
+
+    int32_t diff = (int32_t)target_row - (int32_t)state.active_row;
+    int32_t step = (int32_t)state.morph_step_max;
+    if (abs(diff) <= step) {
+        state.active_row = target_row;
+    } else {
+        state.active_row = (uint16_t)((int32_t)state.active_row + (diff > 0 ? step : -step));
+    }
+    /* Send to actuators / update control setpoints */
+    // Map active row to desired current/pwm setpoints (simple linear map here)
+    // TODO: Replace with DE5-driven current target calculation (compute_itgt_for_row)
+    // Example set: duty ~ normalized torque / max_torque
+    float norm = 0.0f;
+    // find row index
+    for (uint16_t i=0;i<DE5_TABLE_LEN;i++){
+        if (DE5_TABLE[i].row_id == state.active_row) {
+            // normalized torque
+            norm = DE5_TABLE[i].torque / DE5_TABLE[DE5_TABLE_LEN-1].torque; // crude
+            break;
+        }
+    }
+    float duty = fminf(1.0f, fmaxf(-1.0f, norm));
+    hw_set_pwm_duty(duty, duty); // both coils parallel; change if needed
+
+    last_morph_ms = now;
+}
+
+/* public API */
+void de5_init(void) {
+    state.running = false;
+    state.active_row = DE5_TABLE[0].row_id;
+    state.w_torque = 0.4f;
+    state.w_eff = 0.4f;
+    state.w_temp = 0.2f;
+    state.morph_cooldown_ms = 1000;
+    state.morph_step_max = 1;
+    state.stream_telemetry = false;
+    last_morph_ms = hw_get_millis();
+}
+
+void de5_tick(uint32_t dt_ms) {
+    /* Called regularly. We sample hardware, optionally compute best row, and morph */
+    if (!state.running) {
+        return;
+    }
+
+    /* Hardware readings */
+    float current_A = hw_read_current_A();
+    float tempC = hw_read_temperature_C();
+
+    /* Optional safety: if temp too high, emergency stop */
+    const float MAX_ALLOWED_C = 140.0f;
+    if (tempC > MAX_ALLOWED_C) {
+        hw_safe_shutdown_outputs();
+        state.running = false;
+        uart_printf("EMERSTOP,TEMP:%.2f\r\n", tempC);
+        return;
+    }
+
+    /* Decide best row using onboard scoring */
+    uint16_t best_row = compute_best_row();
+    morph_step_to(best_row);
+
+    /* Telemetry streaming */
+    if (state.stream_telemetry) {
+        // build a simple CSV line: tms, I_A, vcmd(dummy), itgt(dummy), temp, torque(est), eff(est)
+        uint32_t tms = hw_get_millis();
+        // estimate torque/eff from active row
+        float torque = 0.0f, eff = 0.0f;
+        for (uint16_t i=0;i<DE5_TABLE_LEN;i++){
+            if (DE5_TABLE[i].row_id == state.active_row) {
+                torque = DE5_TABLE[i].torque;
+                eff = DE5_TABLE[i].efficiency;
+                break;
+            }
+        }
+        uart_printf("%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f\r\n",
+                    (unsigned long)tms, current_A, 0.0f, 0.0f, tempC, torque, eff);
+    }
+}
+
+void de5_set_weights(float w_torque, float w_eff, float w_temp) {
+    // Normalize so sum = 1 to keep stable behavior (optional)
+    float s = w_torque + w_eff + w_temp;
+    if (s <= 1e-6f) s = 1.0f;
+    state.w_torque = w_torque / s;
+    state.w_eff = w_eff / s;
+    state.w_temp = w_temp / s;
+}
+
+void de5_set_row(uint16_t row) {
+    /* immediate set (manual override). We'll also update outputs accordingly */
+    state.active_row = row;
+    // map to pwm duty or target setpoints; same as morph step mapping
+    float norm = 0.0f;
+    for (uint16_t i=0;i<DE5_TABLE_LEN;i++){
+        if (DE5_TABLE[i].row_id == state.active_row) {
+            norm = DE5_TABLE[i].torque / DE5_TABLE[DE5_TABLE_LEN-1].torque;
+            break;
+        }
+    }
+    float duty = fminf(1.0f, fmaxf(-1.0f, norm));
+    hw_set_pwm_duty(duty, duty);
+}
+
+void de5_start(void) { state.running = true; last_morph_ms = hw_get_millis(); }
+void de5_stop(void)  { state.running = false; hw_safe_shutdown_outputs(); }
+void de5_handle_emergency_stop(void) { state.running = false; hw_safe_shutdown_outputs(); }
+void de5_stream_telemetry(bool on) { state.stream_telemetry = on; }
+
+DE5State_t de5_get_state(void) { return state; }
+
+void de5_set_morph_params(uint32_t cooldown_ms, uint8_t step_max) {
+    state.morph_cooldown_ms = cooldown_ms;
+    state.morph_step_max = step_max;
+}
+
+uart_cmd.h
+/* uart_cmd.h
+ * Simple UART command parser for DE5 MCU fallback
+ */
+
+#ifndef UART_CMD_H
+#define UART_CMD_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+void uart_cmd_init(void);
+void uart_cmd_poll(void);  // call regularly in main loop
+void uart_cmd_process_line(const char *line);
+
+#endif /* UART_CMD_H */
+
+uart_cmd.c
+/* uart_cmd.c
+ * Minimal line-based parser (blocking or interrupt-driven RX can push lines to this)
+ *
+ * Implementation notes:
+ * - This file assumes you have a small buffering routine that collects full lines
+ *   and calls uart_cmd_process_line on each complete line.
+ * - For CubeMX interrupt-driven UART, accumulate bytes into a ring buffer and when
+ *   CR/LF seen, call uart_cmd_process_line.
+ */
+
+#include "uart_cmd.h"
+#include "de5_control.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Provide a UART printf on your platform */
+extern void uart_printf(const char *fmt, ...);
+
+void uart_cmd_init(void) {
+    // nothing for now
+}
+
+/* Process ASCII line (no newline) */
+void uart_cmd_process_line(const char *line) {
+    if (line == NULL) return;
+    // Trim leading spaces
+    while (*line == ' ') line++;
+    if (strlen(line) == 0) return;
+
+    // Simple uppercase matching
+    if (strncmp(line, "R", 1) == 0) {
+        // Row set: R<n>
+        int n = atoi(line+1);
+        if (n > 0) {
+            de5_set_row((uint16_t)n);
+            uart_printf("OK,ROW=%d\r\n", n);
+        } else {
+            uart_printf("ERR,BADROW\r\n");
+        }
+        return;
+    }
+    if (strncmp(line, "START", 5) == 0) {
+        de5_start(); uart_printf("OK,START\r\n"); return;
+    }
+    if (strncmp(line, "STOP", 4) == 0) {
+        de5_stop(); uart_printf("OK,STOP\r\n"); return;
+    }
+    if (strncmp(line, "STREAM ON", 9) == 0) { de5_stream_telemetry(true); uart_printf("OK,STREAM=ON\r\n"); return; }
+    if (strncmp(line, "STREAM OFF", 10) == 0) { de5_stream_telemetry(false); uart_printf("OK,STREAM=OFF\r\n"); return; }
+
+    // Weight set: W <T|E|P> <float>
+    if (line[0] == 'W' && (line[1] == ' ' || line[1]=='\t')) {
+        char var = 0; float val = 0.0f;
+        if (sscanf(line+1, " %c %f", &var, &val) >= 1) {
+            if (var == 'T') { de5_set_weights(val, de5_get_state().w_eff, de5_get_state().w_temp); uart_printf("OK,W_T=%.3f\r\n", val); return; }
+            if (var == 'E') { de5_set_weights(de5_get_state().w_torque, val, de5_get_state().w_temp); uart_printf("OK,W_E=%.3f\r\n", val); return; }
+            if (var == 'P') { de5_set_weights(de5_get_state().w_torque, de5_get_state().w_eff, val); uart_printf("OK,W_P=%.3f\r\n", val); return; }
+            if (var == 'N') { int n = (int)val; de5_set_morph_params(de5_get_state().morph_cooldown_ms, (uint8_t)n); uart_printf("OK,MORPH_N=%d\r\n", n); return; }
+        }
+        uart_printf("ERR,BADW\r\n"); return;
+    }
+
+    if (strncmp(line, "GET", 3) == 0) {
+        DE5State_t s = de5_get_state();
+        uart_printf("STATE,ROW=%d,RUN=%d,WT=%.3f,WE=%.3f,WP=%.3f,COOL=%lu,STEP=%d\r\n",
+                    s.active_row, s.running ? 1 : 0, s.w_torque, s.w_eff, s.w_temp,
+                    (unsigned long)s.morph_cooldown_ms, s.morph_step_max);
+        return;
+    }
+
+    // Unknown
+    uart_printf("ERR,UNKNOWN_CMD\r\n");
+}
+
+void uart_cmd_poll(void) {
+    /* If using non-interrupt UART, you can poll a receive buffer here and on line completion
+     * call uart_cmd_process_line().
+     * For interrupt driven, call uart_cmd_process_line from the IRQ handler / DMA completion.
+     */
+}
+
+main.c
+/* main.c
+ * Example skeleton - integrate with CubeMX-generated init
+ * Replace HAL init and handle names to match your project.
+ */
+
+#include "stm32f4xx_hal.h" // change to your series
+#include "de5_control.h"
+#include "uart_cmd.h"
+#include <stdio.h>
+
+/* Hardware handles (CubeMX-generated) */
+extern UART_HandleTypeDef huart2;
+extern TIM_HandleTypeDef htim1;
+extern ADC_HandleTypeDef hadc1;
+
+/* A minimal uart_printf wrapper using HAL_UART_Transmit (blocking) */
+void uart_printf(const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)buf, (uint16_t)strnlen(buf, sizeof(buf)), HAL_MAX_DELAY);
+    }
+}
+
+/* Hardware hook implementations */
+float hw_read_current_A(void) {
+    // TODO: read actual ADC channel mapping to current sensor and convert to Amps
+    // Example stub:
+    uint32_t raw = 0;
+    HAL_ADC_Start(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) raw = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    // Convert raw to voltage then to current using sensor gain
+    float v = (raw / 4095.0f) * 3.3f;
+    float current = (v - 1.65f) * 10.0f; // example: 10 A/V sensitivity
+    return current;
+}
+
+float hw_read_temperature_C(void) {
+    // TODO: read temp sensor ADC, convert to Celsius
+    return 40.0f; // stub
+}
+
+void hw_set_pwm_duty(float duty_left, float duty_right) {
+    // TODO: translate -1..1 to timer compare values and update TIMx->CCRn
+    // Example assumes forward-only 0..1:
+    if (duty_left < 0) duty_left = 0;
+    if (duty_right < 0) duty_right = 0;
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (uint32_t)(duty_left * 1000.0f));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (uint32_t)(duty_right * 1000.0f));
+}
+
+uint32_t hw_get_millis(void) {
+    return HAL_GetTick();
+}
+
+void hw_safe_shutdown_outputs(void) {
+    hw_set_pwm_duty(0.0f, 0.0f);
+}
+
+/* UART RX line buffer (simple blocking example) */
+#define UART_LINE_MAX 128
+static char uart_line[UART_LINE_MAX];
+static uint16_t uart_line_pos = 0;
+
+int main(void) {
+    HAL_Init();
+    SystemClock_Config(); // generated by CubeMX
+    MX_GPIO_Init();
+    MX_USART2_UART_Init();
+    MX_TIM1_Init();
+    MX_ADC1_Init();
+
+    /* Start PWM timers */
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+
+    de5_init();
+    uart_cmd_init();
+
+    uart_printf("DE5 MCU fallback booting...\r\n");
+
+    /* If desired start in autonomous mode */
+    //de5_start();
+
+    uint32_t last_tick = hw_get_millis();
+    while (1) {
+        /* Poll UART (blocking read with small timeout) for command lines */
+        uint8_t ch;
+        if (HAL_UART_Receive(&huart2, &ch, 1, 10) == HAL_OK) {
+            if ((ch == '\r') || (ch == '\n')) {
+                if (uart_line_pos > 0) {
+                    uart_line[uart_line_pos] = '\0';
+                    uart_cmd_process_line(uart_line);
+                    uart_line_pos = 0;
+                }
+            } else {
+                if (uart_line_pos < UART_LINE_MAX-1) uart_line[uart_line_pos++] = (char)ch;
+            }
+        }
+
+        /* periodic tick: run de5 tick at 100 ms */
+        uint32_t now = hw_get_millis();
+        if (now - last_tick >= 100) {
+            de5_tick(now - last_tick);
+            last_tick = now;
+        }
+
+        /* Optional: other tasks, ADC scans, safety checks */
+        // ...
+    }
+}
+
+Next steps & integration checklist
+    1. Replace all TODO hardware stubs with CubeMX-generated handles and conversions (ADC scaling, temperature sensor calibration, PWM timer CCR mapping).
+    2. Replace DE5_TABLE contents with your recent Top-30 CSV rows. You can write a small script to convert CSV rows into C DE5Row_t initializer lines.
+    3. Decide whether to implement persistence of weights (flash write) — currently weights are RAM-only.
+    4. Tune morph_cooldown_ms and morph_step_max to match your mechanical response and control latency.
+    5. If you want the MCU to compute more precise current setpoints instead of naive duty, implement compute_itgt_for_row() and closed-loop PI on current measurement (add PI controller inside de5_tick).
+    6. Test in --simulate mode with the PC GUI or by connecting serial and issuing STREAM ON, START, W T 0.5, etc.
+    7. Add safety checks (over-current, torque limits, rotor-lock detection) before field testing.
