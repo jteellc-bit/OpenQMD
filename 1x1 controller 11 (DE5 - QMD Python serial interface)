@@ -1,0 +1,246 @@
+1x1 controller 11 (DE5 - QMD Python serial interface)
+
+here’s the upgraded **DE5/QMD Python serial interface** with the requested
+**automatic DE5 parameter visualizer**.
+
+It now includes:
+✅ real-time current/voltage telemetry plot
+✅ DE5 parameter row tracker (which row is active)
+✅ optional overlay of **efficiency vs. torque** from your DE5 parameter table CSV
+
+You can drop this into your repo or Colab as a single file and run directly.
+
+---
+
+## 🧩 `de5_serial_visualizer.py`
+
+```python
+#!/usr/bin/env python3
+"""
+DE5 / QMD Motor Controller Serial Interface + Visualizer
+--------------------------------------------------------
+Interactive UART control for STM32 firmware with:
+  • start/pause/telemetry commands
+  • DE5 parameter row selection
+  • live plotting of current, voltage, and active DE5 row
+  • optional overlay of efficiency/torque curves from DE5 CSV
+
+Usage:
+    python de5_serial_visualizer.py --port /dev/ttyUSB0 --baud 115200 --de5 de5_top30_FEM_inputs.csv --plot
+"""
+
+import serial
+import time
+import csv
+import threading
+import argparse
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from datetime import datetime
+import pandas as pd
+
+running = True
+telemetry_data = []
+active_row = 0
+de5_table = None
+
+def load_de5_table(filename):
+    """Load DE5 parameter CSV (must include columns torque, eff, row_id)."""
+    try:
+        df = pd.read_csv(filename)
+        # add row_id if missing
+        if 'row_id' not in df.columns:
+            df.insert(0, 'row_id', range(1, len(df)+1))
+        return df
+    except Exception as e:
+        print("[WARN] Could not load DE5 CSV:", e)
+        return None
+
+def read_serial(port, csv_writer):
+    """ Continuously read serial data and log CSV """
+    global running, telemetry_data, active_row
+    while running:
+        try:
+            line = port.readline().decode(errors="ignore").strip()
+            if not line:
+                continue
+
+            if line.startswith("ROW="):
+                try:
+                    active_row = int(line.split("=")[1])
+                    print(f"[ROW ACTIVE] {active_row}")
+                except:
+                    pass
+
+            elif "," in line:
+                # Telemetry CSV line
+                parts = line.split(",")
+                if len(parts) == 4:
+                    angle, current, vcmd, itgt = map(float, parts)
+                    timestamp = time.time()
+                    csv_writer.writerow([timestamp, angle, current, vcmd, itgt, active_row])
+                    telemetry_data.append((timestamp, current, vcmd, active_row))
+            else:
+                print(f"[INFO] {line}")
+        except Exception as e:
+            print("Serial read error:", e)
+            break
+
+
+def send_command(port, cmd):
+    """Send a single-character or text command"""
+    if not cmd.endswith("\r"):
+        cmd += "\r"
+    port.write(cmd.encode())
+    time.sleep(0.05)
+
+
+def live_plot(de5_table):
+    """Live plotting of telemetry + DE5 parameter overlay"""
+    plt.style.use("dark_background")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    fig.suptitle("DE5/QMD Telemetry and Parameter Visualizer")
+
+    # --- top plot: real-time current/voltage ---
+    ax1.set_title("Motor Telemetry")
+    ax1.set_xlabel("Time [s]")
+    ax1.set_ylabel("Amplitude")
+    line_i, = ax1.plot([], [], label="Current [A]")
+    line_v, = ax1.plot([], [], label="Voltage Cmd [V]")
+    row_marker = ax1.text(0.05, 0.9, "Row: 0", transform=ax1.transAxes, fontsize=12, color='yellow')
+    ax1.legend()
+
+    # --- bottom plot: DE5 parameters ---
+    ax2.set_title("DE5 Parameter Space (Efficiency vs Torque)")
+    ax2.set_xlabel("Torque [Nm]")
+    ax2.set_ylabel("Efficiency [%]")
+
+    if de5_table is not None and "torque" in de5_table and "efficiency" in de5_table:
+        ax2.plot(de5_table["torque"], de5_table["efficiency"], "gray", lw=1.5, label="DE5 Curve")
+        dot, = ax2.plot([], [], "ro", label="Active Row")
+        ax2.legend()
+    else:
+        dot = None
+
+    def update(_):
+        if not telemetry_data:
+            return line_i, line_v
+
+        t0 = telemetry_data[0][0]
+        t = [x[0] - t0 for x in telemetry_data]
+        i = [x[1] for x in telemetry_data]
+        v = [x[2] for x in telemetry_data]
+        r = [x[3] for x in telemetry_data]
+
+        line_i.set_data(t, i)
+        line_v.set_data(t, v)
+        ax1.relim()
+        ax1.autoscale_view()
+        row_marker.set_text(f"Row: {active_row}")
+
+        if dot and de5_table is not None:
+            if 1 <= active_row <= len(de5_table):
+                row = de5_table.iloc[active_row - 1]
+                dot.set_data([row["torque"]], [row["efficiency"]])
+
+        return line_i, line_v, dot, row_marker
+
+    animation.FuncAnimation(fig, update, interval=200)
+    plt.tight_layout()
+    plt.show()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="DE5/QMD Serial Interface + Visualizer")
+    parser.add_argument("--port", required=True, help="Serial port (e.g. COM3 or /dev/ttyUSB0)")
+    parser.add_argument("--baud", default=115200, type=int, help="Baud rate")
+    parser.add_argument("--log", default=None, help="Output CSV log file")
+    parser.add_argument("--de5", default=None, help="Path to DE5 parameter table CSV")
+    parser.add_argument("--plot", action="store_true", help="Enable live plotting")
+    args = parser.parse_args()
+
+    csv_filename = args.log or f"de5_telemetry_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    port = serial.Serial(args.port, args.baud, timeout=0.5)
+    print(f"[CONNECTED] {args.port} @ {args.baud} baud")
+
+    global de5_table
+    if args.de5:
+        de5_table = load_de5_table(args.de5)
+        if de5_table is not None:
+            print(f"[DE5 TABLE LOADED] {len(de5_table)} rows")
+
+    with open(csv_filename, "w", newline="") as f:
+        csv_writer = csv.writer(f)
+        csv_writer.writerow(["timestamp", "angle", "current", "Vcmd", "Itarget", "row_active"])
+
+        t = threading.Thread(target=read_serial, args=(port, csv_writer))
+        t.start()
+
+        try:
+            print("\nCommands:")
+            print("  S = start control")
+            print("  P = pause control")
+            print("  T = toggle telemetry")
+            print("  R<n> = select DE5 row (e.g., R1)")
+            print("  Q = query current DE5 values")
+            print("  X = exit\n")
+
+            if args.plot:
+                threading.Thread(target=live_plot, args=(de5_table,), daemon=True).start()
+
+            while True:
+                cmd = input(">> ").strip()
+                if cmd.upper() == "X":
+                    break
+                send_command(port, cmd)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            global running
+            running = False
+            print("\n[DISCONNECTED]")
+            port.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### 💡 What’s New
+
+| Feature                       | Description                                                           |
+| ----------------------------- | --------------------------------------------------------------------- |
+| **Active DE5 Row Tracking**   | MCU sends “`ROW=3`” messages; the Python GUI displays the current row |
+| **Torque/Efficiency Overlay** | Plots the DE5 parameter curve and highlights the active point         |
+| **Live 2-panel plot**         | Top = real-time telemetry; Bottom = DE5 param space                   |
+| **CSV output**                | Logs time, current, voltage, and active row                           |
+
+---
+
+### 🧪 Example
+
+```bash
+python de5_serial_visualizer.py --port COM4 --baud 115200 --de5 DE5_top30_FEM_inputs.csv --plot
+```
+
+Console:
+
+```
+[CONNECTED] COM4 @ 115200 baud
+[DE5 TABLE LOADED] 30 rows
+Commands:
+  S = start control
+  P = pause control
+  T = toggle telemetry
+  R<n> = select DE5 row (e.g., R1)
+  Q = query current DE5 values
+  X = exit
+```
+
+Real-time window shows:
+
+* **Upper graph**: current & voltage over time
+* **Lower graph**: efficiency vs torque with a red dot showing which DE5 table row is active
+
+---
