@@ -1,0 +1,169 @@
+1x1 controller 7 (advanced `DE5_ComputeControl)
+
+Perfect — here’s the **advanced `DE5_ComputeControl` stub** and supporting files.
+This builds directly on the earlier STM32 skeleton and implements a realistic workflow:
+
+✅ Loads a **DE5 parameter table** (e.g., top design rows or sweep results) from Flash or SD/EEPROM (CSV-like).
+✅ Uses these parameters to compute **target coil currents** and torque commands based on your QMD anti-solution logic (placeholder in code).
+✅ Keeps everything ready for integration with your PWM/ADC loop.
+
+---
+
+### 📁 File: `DE5_Control.c`
+
+```c
+#include "DE5_Control.h"
+#include "stm32f4xx_hal.h"
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+
+#define MAX_DE5_ROWS  32
+#define LINE_BUF_SIZE 128
+
+// Example DE5 parameter struct
+typedef struct {
+    float coil_diam_mm;
+    float air_gap_mm;
+    float poles;
+    float turns;
+    float I_req_A;
+    float pred_torque_Nm;
+    float pred_efficiency;
+    float P_loss_W;
+    float thermal_resistance;
+} DE5_Params;
+
+// Flash-stored or SD-loaded parameter table
+static DE5_Params de5_table[MAX_DE5_ROWS];
+static uint8_t de5_table_loaded = 0;
+
+// Active parameter set
+static DE5_Params active_params;
+
+// Internal helper for CSV parsing
+static int parse_csv_line(char *line, DE5_Params *p) {
+    return sscanf(line, "%f,%f,%f,%f,%f,%f,%f,%f,%f",
+        &p->coil_diam_mm, &p->air_gap_mm, &p->poles,
+        &p->turns, &p->I_req_A, &p->pred_torque_Nm,
+        &p->pred_efficiency, &p->P_loss_W, &p->thermal_resistance
+    ) == 9;
+}
+
+/**
+ * Simulated CSV load (in actual MCU build, use FatFS or EEPROM)
+ */
+void DE5_LoadParamsFromFlash(const char *csv_text)
+{
+    char line[LINE_BUF_SIZE];
+    const char *ptr = csv_text;
+    int idx = 0;
+
+    while (*ptr && idx < MAX_DE5_ROWS) {
+        char *nl = strchr(ptr, '\n');
+        int len = nl ? (nl - ptr) : strlen(ptr);
+        if (len > 0 && len < LINE_BUF_SIZE) {
+            strncpy(line, ptr, len);
+            line[len] = '\0';
+            if (parse_csv_line(line, &de5_table[idx])) idx++;
+        }
+        if (!nl) break;
+        ptr = nl + 1;
+    }
+    de5_table_loaded = 1;
+}
+
+/**
+ * Select an entry from the DE5 table (e.g., highest efficiency)
+ */
+void DE5_SelectActiveRow(int row_idx)
+{
+    if (row_idx >= 0 && row_idx < MAX_DE5_ROWS && de5_table_loaded)
+        active_params = de5_table[row_idx];
+}
+
+/**
+ * Compute control targets — QMD + DE5 hybrid
+ */
+void DE5_ComputeControl(float rotor_angle, float measured_current, DE5_Command *cmd)
+{
+    // Example DE5-inspired “constructive interference” logic
+    float k_eff = active_params.pred_efficiency;
+    float torque_target = active_params.pred_torque_Nm * (k_eff);
+
+    // QMD anti-solution influence factor (simplified)
+    float phase_factor = sinf(rotor_angle * active_params.poles * 0.5f);
+    float constructive = (phase_factor > 0) ? 1.0f : -1.0f;
+
+    // Target current from DE5 & QMD coupling
+    cmd->I_target = active_params.I_req_A * constructive;
+
+    // PI control update: (error * gain)
+    float error = cmd->I_target - measured_current;
+    cmd->V_command = active_params.turns * error * 0.001f; // gain scaled by turns
+
+    // Apply simple limiter
+    if (cmd->V_command > 1.0f) cmd->V_command = 1.0f;
+    if (cmd->V_command < -1.0f) cmd->V_command = -1.0f;
+}
+```
+
+---
+
+### 📁 File: `DE5_Control.h`
+
+```c
+#pragma once
+#include <stdint.h>
+
+typedef struct {
+    float I_target;
+    float V_command;
+} DE5_Command;
+
+void DE5_LoadParamsFromFlash(const char *csv_text);
+void DE5_SelectActiveRow(int row_idx);
+void DE5_ComputeControl(float rotor_angle, float measured_current, DE5_Command *cmd);
+```
+
+---
+
+### 📁 Example CSV snippet (to be stored in flash or SD)
+
+`DE5_table.csv`
+
+```
+coil_diam_mm,air_gap_mm,poles,turns,I_req_A,pred_torque_Nm,pred_efficiency,P_loss_W,thermal_resistance
+515.17,0.29,2,1012,20.0,8271.06,0.999869,81932.44,0.0005
+500.00,0.30,2,980,19.5,7900.00,0.999800,85000.00,0.0008
+480.00,0.32,2,1050,21.0,8100.00,0.999850,83000.00,0.0006
+```
+
+---
+
+### 📁 Example Usage (in main control loop)
+
+```c
+#include "DE5_Control.h"
+
+DE5_Command cmd;
+
+void QMD_UpdateControl(float rotor_angle, float measured_current)
+{
+    DE5_ComputeControl(rotor_angle, measured_current, &cmd);
+    SetPWM_FromVoltageCommand(cmd.V_command); // user-defined low-level driver
+}
+```
+
+---
+
+### 💡 Notes
+
+* In a real STM32 implementation:
+
+  * Replace `DE5_LoadParamsFromFlash` with FatFS read or EEPROM access.
+  * The `rotor_angle` input can come from Hall sensors or encoder feedback.
+  * The QMD logic block can be expanded to compute interference terms dynamically.
+  * `SetPWM_FromVoltageCommand()` maps normalized voltage commands (±1.0) into `TIMx->CCR` duty cycle updates.
+
+---
