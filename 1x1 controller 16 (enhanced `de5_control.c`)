@@ -1,0 +1,286 @@
+1x1 controller 16 (enhanced `de5_control.c`)
+
+Perfect — here’s the **enhanced `de5_control.c`** with a **simple real-time PI current controller** added directly into the DE5 loop.
+This implementation integrates seamlessly with the DE5 adaptive morphing and provides closed-loop regulation of the actual coil current measured via the ADC.
+
+The structure keeps everything MCU-friendly (fixed timestep, float math, optional anti-windup), compatible with your H-bridge or PWM-controlled driver.
+
+---
+
+### 🔧 Features added
+
+* PI current control loop running each `de5_tick()` iteration (100 ms or faster as desired).
+* Automatically sets PWM duty via `hw_set_pwm_duty()` using the controller output.
+* Integrates with the **DE5 morphing** system — i.e., the active DE5 row defines the **target current**.
+* Includes **anti-windup** and safety clamps (`PWM_LIMIT`).
+* Fully deterministic, MCU-safe (no malloc, no float instability).
+* Includes `de5_set_pi_gains(Kp, Ki)` API to tune the loop from UART commands or compile-time constants.
+
+---
+
+### ✅ Drop-in replacement for your existing `de5_control.c`
+
+Everything else (UART, table, telemetry, etc.) remains identical — only new sections are marked with `// === PI Controller Section ===`.
+
+```c
+/* de5_control.c
+ * Implementation of onboard scoring + morphing + simple PI current loop
+ */
+
+#include "de5_control.h"
+#include "string.h"
+#include <math.h>
+#include <stdio.h>
+
+/* TODO: Replace with your HAL UART printf or buffer to send telemetry lines */
+extern void uart_printf(const char *fmt, ...);
+
+/* ----- Hardware hooks: weak stubs (override in main project) ----- */
+__attribute__((weak)) float hw_read_current_A(void) { return 0.0f; }
+__attribute__((weak)) float hw_read_temperature_C(void) { return 25.0f; }
+__attribute__((weak)) void hw_set_pwm_duty(float duty_left, float duty_right) { (void)duty_left; (void)duty_right; }
+__attribute__((weak)) uint32_t hw_get_millis(void) { return 0u; }
+__attribute__((weak)) void hw_safe_shutdown_outputs(void) { hw_set_pwm_duty(0.0f, 0.0f); }
+
+/* ----- DE5 table in flash (edit with your values) ----- */
+static const DE5Row_t DE5_TABLE[] = {
+    {1,  100.0f, 0.90f, 60.0f},
+    {2,  120.0f, 0.91f, 62.0f},
+    {3,  140.0f, 0.92f, 65.0f},
+    {4,  160.0f, 0.925f, 66.0f},
+    {5,  180.0f, 0.93f, 68.0f},
+};
+static const uint16_t DE5_TABLE_LEN = sizeof(DE5_TABLE) / sizeof(DE5_TABLE[0]);
+
+/* module state */
+static DE5State_t state;
+static uint32_t last_morph_ms = 0;
+
+/* === PI Controller Section === */
+static float Kp = 0.02f;           // proportional gain
+static float Ki = 0.001f;          // integral gain
+static float I_target = 0.0f;      // target current (amps)
+static float I_integrator = 0.0f;  // integral accumulator
+static const float PWM_LIMIT = 1.0f;
+static const float I_MAX = 150.0f; // max current protection (A)
+
+void de5_set_pi_gains(float kp, float ki) {
+    Kp = kp; Ki = ki;
+    uart_printf("PI_GAINS,Kp=%.5f,Ki=%.5f\r\n", Kp, Ki);
+}
+
+/* === Helpers === */
+static void normalize_arr(const float *in, float *out, uint16_t len) {
+    float mn = in[0], mx = in[0];
+    for (uint16_t i=1;i<len;i++){
+        if (in[i] < mn) mn = in[i];
+        if (in[i] > mx) mx = in[i];
+    }
+    if (fabsf(mx - mn) < 1e-9f) {
+        for (uint16_t i=0;i<len;i++) out[i] = 0.5f;
+        return;
+    }
+    for (uint16_t i=0;i<len;i++) out[i] = (in[i] - mn) / (mx - mn);
+}
+
+static uint16_t compute_best_row(void) {
+    uint16_t n = DE5_TABLE_LEN;
+    float torque_arr[MAX_DE5_ROWS];
+    float eff_arr[MAX_DE5_ROWS];
+    float temp_arr[MAX_DE5_ROWS];
+    float nt[MAX_DE5_ROWS], ne[MAX_DE5_ROWS], ntemp[MAX_DE5_ROWS];
+    for (uint16_t i=0;i<n;i++){
+        torque_arr[i] = DE5_TABLE[i].torque;
+        eff_arr[i] = DE5_TABLE[i].efficiency;
+        temp_arr[i] = DE5_TABLE[i].est_temp;
+    }
+    normalize_arr(torque_arr, nt, n);
+    normalize_arr(eff_arr, ne, n);
+    normalize_arr(temp_arr, ntemp, n);
+
+    float best_score = -1e9f;
+    uint16_t best_idx = 0;
+    for (uint16_t i=0;i<n;i++){
+        float score = state.w_torque * nt[i] + state.w_eff * ne[i] + state.w_temp * (1.0f - ntemp[i]);
+        if (score > best_score) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+    return DE5_TABLE[best_idx].row_id;
+}
+
+/* Compute the target current (A) for a given row */
+static float compute_itgt_for_row(uint16_t row_id) {
+    for (uint16_t i=0;i<DE5_TABLE_LEN;i++) {
+        if (DE5_TABLE[i].row_id == row_id) {
+            // Simple mapping: torque proportional to current
+            return DE5_TABLE[i].torque * 0.1f;  // adjust scaling to real motor constant
+        }
+    }
+    return 0.0f;
+}
+
+/* Apply morph step toward target row */
+static void morph_step_to(uint16_t target_row) {
+    uint32_t now = hw_get_millis();
+    if (now - last_morph_ms < state.morph_cooldown_ms) return;
+    if (target_row == state.active_row) return;
+
+    int32_t diff = (int32_t)target_row - (int32_t)state.active_row;
+    int32_t step = (int32_t)state.morph_step_max;
+    if (abs(diff) <= step) {
+        state.active_row = target_row;
+    } else {
+        state.active_row = (uint16_t)((int32_t)state.active_row + (diff > 0 ? step : -step));
+    }
+    last_morph_ms = now;
+
+    // Update new target current
+    I_target = compute_itgt_for_row(state.active_row);
+}
+
+/* === PI Controller implementation === */
+static void run_current_pi(float dt_s) {
+    float I_meas = hw_read_current_A();
+
+    // Safety limit
+    if (fabsf(I_meas) > I_MAX) {
+        hw_safe_shutdown_outputs();
+        uart_printf("EMERSTOP,OCURR,%.2f\r\n", I_meas);
+        state.running = false;
+        return;
+    }
+
+    // Compute error and PI output
+    float error = I_target - I_meas;
+    I_integrator += error * Ki * dt_s;
+
+    // Anti-windup
+    if (I_integrator > PWM_LIMIT) I_integrator = PWM_LIMIT;
+    if (I_integrator < -PWM_LIMIT) I_integrator = -PWM_LIMIT;
+
+    float output = Kp * error + I_integrator;
+    if (output > PWM_LIMIT) output = PWM_LIMIT;
+    if (output < -PWM_LIMIT) output = -PWM_LIMIT;
+
+    // Send to hardware
+    hw_set_pwm_duty(output, output);
+}
+
+/* === Main control flow === */
+void de5_init(void) {
+    state.running = false;
+    state.active_row = DE5_TABLE[0].row_id;
+    state.w_torque = 0.4f;
+    state.w_eff = 0.4f;
+    state.w_temp = 0.2f;
+    state.morph_cooldown_ms = 1000;
+    state.morph_step_max = 1;
+    state.stream_telemetry = false;
+    last_morph_ms = hw_get_millis();
+
+    I_target = 0.0f;
+    I_integrator = 0.0f;
+}
+
+void de5_tick(uint32_t dt_ms) {
+    if (!state.running) return;
+    float dt_s = dt_ms / 1000.0f;
+
+    float tempC = hw_read_temperature_C();
+    if (tempC > 140.0f) {
+        hw_safe_shutdown_outputs();
+        uart_printf("EMERSTOP,TEMP=%.2f\r\n", tempC);
+        state.running = false;
+        return;
+    }
+
+    // Determine best DE5 row based on weights and morph if needed
+    uint16_t best_row = compute_best_row();
+    morph_step_to(best_row);
+
+    // Update PI current control
+    run_current_pi(dt_s);
+
+    // Telemetry
+    if (state.stream_telemetry) {
+        float I_meas = hw_read_current_A();
+        uint32_t tms = hw_get_millis();
+        float torque = 0.0f, eff = 0.0f;
+        for (uint16_t i=0;i<DE5_TABLE_LEN;i++){
+            if (DE5_TABLE[i].row_id == state.active_row) {
+                torque = DE5_TABLE[i].torque;
+                eff = DE5_TABLE[i].efficiency;
+                break;
+            }
+        }
+        uart_printf("%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f\r\n",
+                    (unsigned long)tms, I_meas, 0.0f, I_target, tempC, torque, eff);
+    }
+}
+
+void de5_set_weights(float w_torque, float w_eff, float w_temp) {
+    float s = w_torque + w_eff + w_temp;
+    if (s <= 1e-6f) s = 1.0f;
+    state.w_torque = w_torque / s;
+    state.w_eff = w_eff / s;
+    state.w_temp = w_temp / s;
+}
+
+void de5_set_row(uint16_t row) {
+    state.active_row = row;
+    I_target = compute_itgt_for_row(row);
+}
+
+void de5_start(void) {
+    state.running = true;
+    last_morph_ms = hw_get_millis();
+    I_integrator = 0.0f;
+    uart_printf("RUN,START\r\n");
+}
+
+void de5_stop(void)  { state.running = false; hw_safe_shutdown_outputs(); uart_printf("RUN,STOP\r\n"); }
+void de5_handle_emergency_stop(void) { state.running = false; hw_safe_shutdown_outputs(); uart_printf("EMERSTOP\r\n"); }
+void de5_stream_telemetry(bool on) { state.stream_telemetry = on; uart_printf("STREAM,%d\r\n", on ? 1 : 0); }
+DE5State_t de5_get_state(void) { return state; }
+void de5_set_morph_params(uint32_t cooldown_ms, uint8_t step_max) { state.morph_cooldown_ms = cooldown_ms; state.morph_step_max = step_max; }
+```
+
+---
+
+### 🔍 Summary of new functions
+
+| Function                       | Description                                |
+| ------------------------------ | ------------------------------------------ |
+| `compute_itgt_for_row(row_id)` | Converts DE5 row torque → target current   |
+| `run_current_pi(dt_s)`         | Real-time PI loop; clamps integral/output  |
+| `de5_set_pi_gains(kp, ki)`     | UART-callable tuning                       |
+| `I_target`                     | Dynamic current target (A)                 |
+| `I_integrator`                 | Integral state of PI controller            |
+| Safety                         | Stops on overcurrent or overtemp instantly |
+
+---
+
+### 🧠 Tuning recommendations
+
+1. Start with **Kp = 0.02**, **Ki = 0.001**.
+   If oscillations → reduce Kp.
+   If sluggish → increase Kp or slightly Ki.
+2. Use UART command to adjust while running:
+
+   ```
+   W T 0.4
+   W E 0.4
+   W P 0.2
+   START
+   ```
+
+   Then add command (to be added in `uart_cmd.c` if desired):
+
+   ```
+   PI 0.03 0.002
+   ```
+3. Target current scaling (`0.1f` in `compute_itgt_for_row`) should be adjusted to your motor’s torque constant (Nm/A).
+
+---
