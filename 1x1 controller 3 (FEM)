@@ -1,0 +1,224 @@
+1x1 controller 3 (FEM)
+
+ **DE5 1×1 electromagnetic motor FEM and QMD control chain**.
+Let’s generate **(A)** the `README_FEM.txt` (for your simulation engineer), and **(B)** the **Arduino/PlatformIO C++ variant** (with notes on porting to STM32CubeMX).
+
+---
+
+## 🧩 (A) `README_FEM.txt`
+
+```
+README_FEM.txt
+========================
+DE5 Motor FEM Modeling Notes
+========================
+
+Objective:
+----------
+This document provides guidelines for reproducing or refining finite element electromagnetic (FEM) simulations
+for the DE5 "1×1" wireless-coil motor prototype. It assumes COMSOL Multiphysics, Ansys Maxwell, or Elmer FEM
+(but the setup is portable).
+
+Core Concept:
+--------------
+This model represents a simplified **double-double sandwich** motor assembly:
+1. Outer stator coil (wired)
+2. Rotor dual-coil (wireless, power received via coupling)
+3. Central wireless power transfer coil
+4. Second rotor dual-coil (symmetrical)
+5. Opposite stator coil (wired)
+
+All coils are electromagnets (no permanent magnets).
+
+-----------------------------------
+1. Geometry & Meshing Guidelines
+-----------------------------------
+- Geometry domain: Cylindrical symmetry, use 2D axisymmetric model if possible for steady-state; 3D only for transient or EMI.
+- Typical dimensions:
+  * Rotor/stator radius: 0.25–0.26 m (based on coil_diam_mm = 515.17)
+  * Air gap: 0.29 mm
+  * Coil cross-section: rectangular, 10–20 mm²
+  * Total axial stack: 5 layers (stator–rotor–WPT–rotor–stator)
+
+- Mesh density recommendations:
+  * Air gap: < 0.05 mm element size
+  * Coil regions: adaptive tetrahedral, max element size 0.5–1 mm
+  * Magnetic core: moderate density, element size ≤ 2 mm
+  * Exterior air: coarser mesh, growth rate ≤ 1.3
+
+- Convergence: Check that B-field peaks and torque change < 1% between refinement steps.
+
+-----------------------------------
+2. Material Definitions
+-----------------------------------
+- Core: Silicon steel (μr = 4000, σ = 2×10⁶ S/m)
+- Coil conductors: Copper or aluminum (anisotropic if ribbon-based)
+- Air gap: μr = 1, σ = 0
+- Graphite spreader (if modeled thermally): k = 700 W/mK (anisotropic, axial > radial)
+
+-----------------------------------
+3. Physics Interfaces
+-----------------------------------
+- Magnetostatic (for DC field characterization)
+- Magnetic Fields (mf) time-harmonic for AC sweep or steady excitation
+- Coupled Thermal-Electric if thermal dissipation is studied
+
+-----------------------------------
+4. Boundary Conditions
+-----------------------------------
+- Magnetic insulation (A × n = 0) on outer domain
+- Continuity between layers
+- Coil terminal excitation:
+  * stator coils → voltage-driven or current-driven (via input current density J)
+  * rotor coils → mutual inductive coupling (WPT excitation)
+- Symmetry along central plane (if ½ geometry is used)
+
+-----------------------------------
+5. Simulation Types
+-----------------------------------
+- Steady-State (Magnetostatic): For torque constant, flux linkage, inductance mapping
+- Transient: For time-dependent torque, switching, EMI
+- Frequency-domain: For harmonic response (DE5 QMD comparison)
+
+-----------------------------------
+6. Output Variables
+-----------------------------------
+- B-field vector maps (T)
+- Inductance matrix (L_ij)
+- Torque (Nm) via Maxwell stress tensor
+- Power loss (W)
+- Temperature (°C) under P_loss from DE5 model
+- Coupling coefficient k between WPT and rotor coils
+
+-----------------------------------
+7. Export for DE5 Integration
+-----------------------------------
+- Export CSV of L_ij, torque, and P_loss vs I or angle θ
+  * Example columns: ["theta_deg", "L11", "L12", "L22", "Torque_Nm", "P_loss_W"]
+- These are consumed by: `DE5_fit_FEM_response.py`
+- Steady-state flag: `steady=1` for magnetostatic, `steady=0` for transient
+
+-----------------------------------
+8. Validation Targets
+-----------------------------------
+Compare coil_temp_est_C and torque_Nm to DE5 predicted values:
+  - pred_torque_Nm ≈ 8271.06
+  - coil_temp_est_C ≈ 33–65°C depending on thermal resistance
+  - efficiency ≥ 0.9998
+
+-----------------------------------
+9. Notes for FEM Engineer
+-----------------------------------
+- Save all results as parametric studies vs. excitation current (10–20 A)
+- Check vector potential continuity across the WPT coil
+- Maintain physical layering sequence exactly (5-layer symmetry)
+- Use same mesh for comparative cooling configurations (baseline / graphite / hybrid)
+```
+
+---
+
+## ⚙️ (B) Arduino / PlatformIO C++ Variant (QMD Control Skeleton)
+
+This version abstracts the **QMD/DE5 output → PWM/H-Bridge control loop**.
+
+```cpp
+// QMD-Controlled H-Bridge Driver (Arduino/PlatformIO)
+// Version: DE5_MotorController v0.1
+// Description:
+//   Basic framework to drive the 1×1 DE5 motor via QMD-computed coil commands.
+//   Two main stator H-bridges (A, B) + optional third for fine control.
+
+#include <Arduino.h>
+
+// ===== Pin Assignments =====
+#define HBRIDGE_A_IN1 3
+#define HBRIDGE_A_IN2 4
+#define HBRIDGE_B_IN1 5
+#define HBRIDGE_B_IN2 6
+#define PWM_FREQ 20000  // 20 kHz switching
+#define UART_BAUD 115200
+
+// ===== Runtime State =====
+float i_ref_A = 0.0f;   // desired current stator A
+float i_ref_B = 0.0f;   // desired current stator B
+float i_meas_A = 0.0f;
+float i_meas_B = 0.0f;
+
+// ===== PI Controller Gains =====
+float Kp = 0.1f;
+float Ki = 0.05f;
+float err_int_A = 0.0f, err_int_B = 0.0f;
+
+// ===== Function Declarations =====
+void setBridgePolarity(int in1, int in2, float u);
+float PI_update(float ref, float meas, float &err_int);
+
+// ===== Setup =====
+void setup() {
+  Serial.begin(UART_BAUD);
+  pinMode(HBRIDGE_A_IN1, OUTPUT);
+  pinMode(HBRIDGE_A_IN2, OUTPUT);
+  pinMode(HBRIDGE_B_IN1, OUTPUT);
+  pinMode(HBRIDGE_B_IN2, OUTPUT);
+  analogWriteFrequency(HBRIDGE_A_IN1, PWM_FREQ);
+  analogWriteFrequency(HBRIDGE_B_IN1, PWM_FREQ);
+  Serial.println("DE5 QMD Motor Controller Ready");
+}
+
+// ===== Main Loop =====
+void loop() {
+  // Example: read DE5 QMD commands (CSV or serial string: "A:0.5,B:-0.3")
+  if (Serial.available()) {
+    String msg = Serial.readStringUntil('\n');
+    if (msg.startsWith("A:")) {
+      int idxB = msg.indexOf(",B:");
+      i_ref_A = msg.substring(2, idxB).toFloat();
+      i_ref_B = msg.substring(idxB + 3).toFloat();
+    }
+  }
+
+  // Mock measured current (replace with ADC sampling)
+  i_meas_A = i_ref_A * 0.9; 
+  i_meas_B = i_ref_B * 0.9;
+
+  // PI control output voltage (-1.0 to 1.0)
+  float uA = PI_update(i_ref_A, i_meas_A, err_int_A);
+  float uB = PI_update(i_ref_B, i_meas_B, err_int_B);
+
+  setBridgePolarity(HBRIDGE_A_IN1, HBRIDGE_A_IN2, uA);
+  setBridgePolarity(HBRIDGE_B_IN1, HBRIDGE_B_IN2, uB);
+
+  delayMicroseconds(100);
+}
+
+// ===== Helper Functions =====
+float PI_update(float ref, float meas, float &err_int) {
+  float err = ref - meas;
+  err_int += err * 0.001;
+  float u = Kp * err + Ki * err_int;
+  u = constrain(u, -1.0, 1.0);
+  return u;
+}
+
+void setBridgePolarity(int in1, int in2, float u) {
+  int pwm = abs(u) * 255;
+  if (u >= 0) {
+    analogWrite(in1, pwm);
+    analogWrite(in2, 0);
+  } else {
+    analogWrite(in1, 0);
+    analogWrite(in2, pwm);
+  }
+}
+```
+
+🧠 **Conceptual Flow:**
+
+* The **DE5/QMD model** computes the constructive “push/pull” polarity pattern.
+* The **C++ controller** receives those desired coil currents via UART.
+* The H-bridge polarity flips emulate the dynamic pole-switching predicted by the DE5.
+* This skeleton can be expanded for STM32CubeMX with three PWM channels and ADC current feedback.
+
+---
+
+
