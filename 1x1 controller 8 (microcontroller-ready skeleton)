@@ -1,0 +1,162 @@
+1x1 controller 8 (microcontroller-ready skeleton)
+
+here’s the **microcontroller-ready skeleton** integrating your `DE5_Control` (QMD + DE5 logic) with **ADC sampling**, **PWM updates**, and **UART telemetry**.
+
+This version is written in STM32 HAL style (CubeIDE-ready) and designed for real-time operation on a Cortex-M MCU.
+It can be compiled directly once you drop it into a CubeMX project configured with:
+✅ 3 PWM outputs, 2 ADC inputs, 1 UART, and a 1 kHz control interrupt (TIM update or SysTick).
+
+---
+
+### 📁 File `main.c`
+
+```c
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "DE5_Control.h"
+#include "QMD_Control.h"
+#include "stm32f4xx_hal.h"
+#include <stdio.h>
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+TIM_HandleTypeDef htim1;   // PWM
+TIM_HandleTypeDef htim2;   // Control timer (1 kHz)
+UART_HandleTypeDef huart2;
+
+/* Private user code ---------------------------------------------------------*/
+static float rotor_angle = 0.0f;
+static float measured_current = 0.0f;
+static DE5_Command de5_cmd;
+static char uart_buf[128];
+
+/* External functions --------------------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_USART2_UART_Init(void);
+
+/* --- helper functions --- */
+void SetPWM_FromVoltageCommand(float v_norm)
+{
+    // Map ±1.0 → duty 0–100%
+    if (v_norm > 1.0f) v_norm = 1.0f;
+    if (v_norm < -1.0f) v_norm = -1.0f;
+    uint32_t duty = (uint32_t)((v_norm * 0.5f + 0.5f) * (__HAL_TIM_GET_AUTORELOAD(&htim1)));
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty);
+}
+
+/* --- control loop called at 1 kHz --- */
+void Control_Loop(void)
+{
+    // Read current via ADC
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, 10);
+    measured_current = (float)HAL_ADC_GetValue(&hadc1) * (3.3f / 4096.0f);
+
+    // Compute DE5/QMD command
+    DE5_ComputeControl(rotor_angle, measured_current, &de5_cmd);
+
+    // Apply PWM command
+    SetPWM_FromVoltageCommand(de5_cmd.V_command);
+
+    // Telemetry
+    int len = snprintf(uart_buf, sizeof(uart_buf),
+        "ang=%.3f I=%.3f V=%.3f Itgt=%.3f\r\n",
+        rotor_angle, measured_current, de5_cmd.V_command, de5_cmd.I_target);
+    HAL_UART_Transmit(&huart2, (uint8_t*)uart_buf, len, 10);
+
+    // Advance synthetic rotor angle (for bench test)
+    rotor_angle += 0.05f;
+    if (rotor_angle > 2 * 3.14159f) rotor_angle -= 2 * 3.14159f;
+}
+
+/* --- main --- */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_ADC1_Init();
+    MX_TIM1_Init();
+    MX_TIM2_Init();
+    MX_USART2_UART_Init();
+
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_Base_Start_IT(&htim2);
+
+    // Load sample DE5 table
+    const char *csv =
+        "515.17,0.29,2,1012,20.0,8271.06,0.999869,81932.44,0.0005\n"
+        "480.00,0.32,2,1050,21.0,8100.00,0.999850,83000.00,0.0006\n";
+    DE5_LoadParamsFromFlash(csv);
+    DE5_SelectActiveRow(0);
+
+    while (1)
+    {
+        // main loop idle — control via timer interrupt
+    }
+}
+
+/* --- 1 kHz control timer ISR --- */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2)
+        Control_Loop();
+}
+```
+
+---
+
+### 📁 File `QMD_Control.c` (bridge layer)
+
+```c
+#include "QMD_Control.h"
+#include "DE5_Control.h"
+
+extern void SetPWM_FromVoltageCommand(float v_norm);
+
+/* Basic placeholder for QMD dynamics */
+void QMD_Update(float rotor_angle, float measured_current)
+{
+    DE5_Command cmd;
+    DE5_ComputeControl(rotor_angle, measured_current, &cmd);
+    SetPWM_FromVoltageCommand(cmd.V_command);
+}
+```
+
+---
+
+### 📁 File `QMD_Control.h`
+
+```c
+#pragma once
+#include <stdint.h>
+
+void QMD_Update(float rotor_angle, float measured_current);
+```
+
+---
+
+### ⚙️ CubeMX / HAL Notes
+
+| Peripheral | Role                            | Config summary                                           |
+| ---------- | ------------------------------- | -------------------------------------------------------- |
+| **TIM1**   | PWM output → H-Bridge           | Channel 1 (20 kHz ideal), complementary outputs optional |
+| **TIM2**   | Control-loop timer              | 1 kHz update interrupt                                   |
+| **ADC1**   | Current sense input             | Single channel, triggered by TIM1 or polled              |
+| **USART2** | Telemetry / DE5 command         | 115200 baud, 8N1                                         |
+| **GPIO**   | Enable/H-Bridge direction lines | Optional digital outputs                                 |
+
+---
+
+### 🧩 Extension hooks
+
+* Replace the synthetic `rotor_angle` increment with an encoder read.
+* Add `UART` receive interrupt for DE5 command updates (e.g., row selection, gain tuning).
+* Extend `Control_Loop()` to handle multi-channel PWM (TIM1 CH1–CH3) for the double-H-bridge variant.
+* When adding FatFS, call `DE5_LoadParamsFromFlash()` with a file buffer from SD.
+
+---
