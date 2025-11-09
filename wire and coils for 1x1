@@ -1,0 +1,85 @@
+Below I give a detailed, engineering-grade comparison (thermal, electrical, mechanical, EMI), practical manufacturing notes, mitigation strategies for the usual pitfalls (eddy/current loops, centrifugal stress), quick back-of-the-envelope calculations so you can compare copper area & DC resistance, suggested experiments to validate, and a clear recommendation for the 1x1 QMD motor path forward.
+
+Short summary / headline recommendation
+For the 1x1 QMD motor, flat ribbon / copper tape (insulated foil stacks, possibly multiple thin ribbons laminated) is likely the best practical choice for stator/drive coils: it gives higher slot fill, better surface area for cooling, lower DC resistance for a given package, and simpler manufacturing than heavy-copper PCB coils. Use thin, insulated ribbons (or stacked insulated foil) arranged to break circulating eddy loops and mechanically retain them (impregnation + banding). Reserve PCB coils only for very small, low-power prototypes or where precise planar geometry is needed and cost/weight are acceptable.
+
+1 — Electrical performance (DC and AC)
+    • DC resistance depends on conductor cross-sectional area (A) and resistivity ρ: R = ρ·L/A. A ribbon with the same area as a round wire has the same DC resistance. But the slot fill matters: ribbons pack flatter and reduce wasted slot space, so for the same slot volume you can have more copper cross-section, therefore lower R than using round conductors that leave gaps.
+    • Surface area: ribbon has larger external surface area per unit copper — better convective cooling and easier conduction into graphoil/TIM.
+    • Skin & proximity effects (AC): at electrical frequencies (f_elec = p·RPM/60), skin depth δ = sqrt(2ρ/ωμ). If coil currents are low frequency (EV motors: several hundred Hz at max electrical speed; e-bike low), skin/proximity can be significant for thick conductors.
+        ◦ Mitigation: use many thin ribbons (stacked & insulated) rather than one thick foil. That reduces effective eddy currents and lowers AC loss (same principle as Litz wire).
+        ◦ If you must use a single thick ribbon, consider transposing or splitting the ribbon into parallel insulated strips so induced circulating currents between layers are suppressed.
+    • Conclusion: For the expected operating currents (tens to hundreds of A) and likely frequencies, thin insulated ribbon stacks or transposed foil stacks are preferred to avoid AC loss penalties.
+
+2 — Thermal behavior & cooling
+    • Ribbon increases external area contact to TIM/graphite spreader, enabling lower contact thermal resistance and faster heat extraction.
+    • Higher fill factor → less copper resistance → lower I²R losses for same torque, or for same current gives higher torque — both help thermal budget.
+    • Ribbon allows direct bonding to graphoil spreader or thermal pads across broad surfaces, lowering contact resistance vs round wires that only touch at discrete points.
+
+3 — EMI, eddy currents and magnetic losses
+    • Risk: wide, continuous foil can support large eddy currents in the presence of time-varying magnetic flux (especially if ribbon runs form large loops or are exposed to radial field variation).
+    • Mitigations:
+        1. Segment / insulate between layers — stack N thin insulated ribbons instead of one thick piece. Breaking vertical conduction suppresses loop currents between layers.
+        2. Transposition — if using several parallel ribbons, interchange their relative positions along the winding (or use braided/stranded ribbon) to average out induced voltages.
+        3. Slot liners / magnetic shielding — use insulating ferromagnetic liners or skew slots to smooth flux coupling and reduce concentrated crossing flux.
+        4. Use rectangular bars with insulated gaps for very high current, but treat as many parallel ribbons.
+        5. If high-frequency switching/fast transients are present, use snubbers, proper PWM filtering, and EMI shielding to control emissions.
+    • PCB coils: inherently segmented (traces separated by dielectric) so they avoid internal large eddy loops, but individual trace thickness is small so DC R is high unless heavy copper used (costly).
+
+4 — Mechanical & manufacturing considerations
+    • Winding: ribbon can be wound, but must be controlled to prevent twisting or sharp corners. Use mandrels / formers shaped to the slot.
+    • Insulation: prefer pre-insulated flat copper tape or apply thin enamel/phosphor-bronze adhesive + Kapton/nomex. Keep insulation thin to keep fill factor high.
+    • Joining: soldering many ribbon layers is harder than soldering round wire. Use ultrasonic welding, resistance spot welding, or brazing for high-amp joints; mechanical crimps with large contact areas can work if properly plated. For series connections between ribbon runs, consider laser or ultrasonic welding.
+    • Centrifugal forces (rotor coils): if coils are on the rotor, ribbons must be retained against radial outward force. Use high-strength banding, potting compounds, or mechanical clamps. If stator winding, less severe.
+    • Vibration & abrasion: encapsulate with varnish or epoxy and use mechanical anchors at turn ends.
+    • Thermal expansion & cycling: laminates & adhesives must tolerate cycles; graphoil contact requires compliant TIM to maintain low contact resistance.
+
+5 — Practical construction options & patterns
+    1. Stacked, insulated foil ribbons: e.g., 5 × (0.25 mm × 10 mm) insulated ribbons stacked — gives low R, manageable skin depth, simple stacking. Use polymer interleaves for insulation.
+    2. Interleaved pancake coils using ribbons (good for axial flux or planar motors).
+    3. Rectangular copper bars / busbars for very low-turn, high-current windings (use varnish/impregnation and segmentation to reduce eddy loops).
+    4. Litz-like flat wire: many insulated micro-ribbons twisted/transposed — combines skin mitigation with good fill.
+    5. PCB (heavy copper) only if: small size, low power, need for integrated sensors/embedded routes, or rapid prototyping — otherwise heavy copper PCBs are heavy and expensive for high current.
+
+6 — Quick numerical example (compare effective copper area and DC resistance)
+Example: round wire d = 2.0 mm → A_round = π·(2.0)^2/4 = 3.1416 mm^2.
+Ribbon: w = 4.0 mm, t = 0.9 mm → A_ribbon = 4.0×0.9 = 3.6 mm^2 → ~15% more area → ~15% lower DC resistance for same conductor length.
+If slot allows 4 round wires (4×3.1416 = 12.566 mm^2) vs 3 ribbon stacks (3×3.6 = 10.8 mm^2) — this depends on packing, but generally ribbon increases usable copper fraction because packing is tighter (less interstitial air). Always calculate slot fill = copper_area_total / slot_volume_cross_section.
+
+7 — How ribbon helps copper losses & heat simultaneously
+    • Higher fill factor → lower copper resistance and lower I²R losses.
+    • Larger exposed area per conductor → better convective cooling and easier conduction into graphoil spreader → lower operating temperature and thus lower resistivity increase with temperature.
+    • These two effects are multiplicative: better fill reduces loss, improved cooling reduces temperature rise, reducing resistivity and allowing higher current duty.
+
+8 — Downsides & where PCB might still win
+    • Eddy currents: poor ribbon implementation can be worse than round wire if large area loops form. Must engineer layers/insulation.
+    • Mechanical complexity: making many fine, insulated ribbons and assembling them can be more labor-intensive than winding round wire on a coil winder (but this is easily automated).
+    • Joining: ribbon joints require welding/crimping; soldering thick ribbons can be tricky.
+    • PCB advantages: precision geometry, integrated features (sensors, connectors), and easy repeatability for low power. But PCB copper thickness limits and cost for very heavy copper make them less attractive for the high-current motors you’re exploring.
+
+9 — EMI & thermal synergy — design pattern I recommend
+For your 1x1 QMD motor:
+    1. Use stacked insulated ribbon packs for each slot; each pack is composed of N thin foil ribbons (e.g., 5–12 ribbons of 0.2–0.5 mm thickness), each individually insulated. This reduces eddy loops and skin loss.
+    2. Bond the outer face of the ribbon pack to a graphoil layer with a thin compliant TIM to maximize spreading to fins. Ensure graphoil sectors are electrically isolated to avoid eddy loops.
+    3. Consider 2–4 thin flat heat pipes routed to the fin pack if radial route is long (large rotor diameters). Keep them minimal — the graphoil carries lateral heat, pipes carry hub→rim.
+    4. Impregnate/varnish the winding for mechanical integrity and to reduce micro-movements which can cause wear and EMI.
+    5. Use mechanical retaining bands and/or resin potting at the coil edges to survive centrifugal loads.
+    6. For connectors/joints, plan for ultrasonic welds or brazed joints rather than simple solder for high current.
+
+10 — Tests & validation plan (practical)
+Before committing to mass manufacturing:
+    1. Build 3 small prototype winding samples:
+        ◦ A: round wire baseline
+        ◦ B: ribbon stack (as-built)
+        ◦ C: PCB coil (if feasible)
+    2. Measure DC resistance & IR thermal test at target current (20 A / 100 A pulses) and record temperature vs time.
+    3. Measure AC loss at switching frequency of your controller (or simulated waveform) to capture skin/proximity losses.
+    4. Centrifuge or spin test rotor-mounted sample at expected RPM to validate mechanical retention.
+    5. EMI scan and near-field measurement with and without graphoil shielding.
+    6. Thermal characterization: measure effective R_th from coil to ambient for each cooling approach (graphoil alone, graphoil + few heat pipes, heat-pipe only).
+    7. Use measured R_th and losses to update surrogate & Pareto.
+
+11 — Additional manufacturing & supply notes
+    • Pre-insulated copper foil is available from magnet wire suppliers (Polyimide/Kapton coated foils). Specify thickness and coating class.
+    • For large-scale runs, stamping preformed ribbon coils or automated ribbon winders reduce labor.
+    • Consider contacting coil manufacturers experienced in foil windings (servo/traction motors use similar tech) for production guidance.
