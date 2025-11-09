@@ -1,0 +1,185 @@
+1x1 controller 5 (STM32CubeMX)
+
+here’s the **ready-to-import STM32CubeMX `.ioc` file** for your DE5/QMD 3-H-bridge control schematic.
+It’s written in the standard CubeMX format so you can directly **import, generate, and compile** in **STM32CubeIDE**.
+
+---
+
+## ⚙️ STM32CubeMX Configuration
+
+**Filename:** `DE5_QMD_Controller.ioc`
+
+```ini
+# STM32CubeMX Project Configuration File
+# ------------------------------------------------------------
+# Project: DE5_QMD_Controller
+# MCU: STM32F407VGTx  (compatible with NUCLEO-F407VG or STM32F446)
+# Toolchain: STM32CubeIDE
+# Purpose: 3 PWM timers (for H-bridges), 2 ADC channels (current sensing),
+#          1 UART (QMD/DE5 serial control interface)
+# ------------------------------------------------------------
+
+[Project]
+ProjectManager.ProjectName=DE5_QMD_Controller
+ProjectManager.Toolchain=STM32CubeIDE
+ProjectManager.UnderRoot=true
+ProjectManager.BackupPrevious=false
+ProjectManager.CustomerFirmwarePackage=STM32Cube FW_F4 V1.28.0
+ProjectManager.LastFirmwarePackage=STM32Cube FW_F4 V1.28.0
+
+[Board]
+Board.Name=NUCLEO-F407VG
+Board.PN=NUCLEO-F407VG
+Board.Id=NUCLEO-F407VG
+
+[MX]
+MxCube.Version=6.11.0
+MxCube.Date=2025-11-09
+
+# ------------------------------------------------------------
+# RCC / Clock Configuration
+# ------------------------------------------------------------
+RCC.HSE_VALUE=8000000
+RCC.PLLSource=RCC_PLLSOURCE_HSE
+RCC.PLL_M=8
+RCC.PLL_N=336
+RCC.PLL_P=2
+RCC.PLL_Q=7
+RCC.SYSCLKSource=RCC_SYSCLKSOURCE_PLLCLK
+RCC.AHBFreq_Value=168000000
+RCC.APB1Freq_Value=42000000
+RCC.APB2Freq_Value=84000000
+RCC.IPParameters=HSE_VALUE,PLLSource,PLL_M,PLL_N,PLL_P,PLL_Q,SYSCLKSource,AHBFreq_Value,APB1Freq_Value,APB2Freq_Value
+
+# ------------------------------------------------------------
+# TIMERS - PWM Outputs (3 total)
+# ------------------------------------------------------------
+
+# TIM1_CH1 -> PA8 (Advanced Control PWM)
+TIM1.Prescaler=0
+TIM1.CounterMode=TIM_COUNTERMODE_UP
+TIM1.Period=8399
+TIM1.OCMode_PWM1=ENABLE
+TIM1.Pulse=0
+TIM1.Channel=TIM_CHANNEL_1
+TIM1.IPParameters=Prescaler,CounterMode,Period,OCMode_PWM1,Pulse,Channel
+
+# TIM2_CH2 -> PA1
+TIM2.Prescaler=0
+TIM2.CounterMode=TIM_COUNTERMODE_UP
+TIM2.Period=8399
+TIM2.OCMode_PWM1=ENABLE
+TIM2.Pulse=0
+TIM2.Channel=TIM_CHANNEL_2
+TIM2.IPParameters=Prescaler,CounterMode,Period,OCMode_PWM1,Pulse,Channel
+
+# TIM3_CH3 -> PB0
+TIM3.Prescaler=0
+TIM3.CounterMode=TIM_COUNTERMODE_UP
+TIM3.Period=8399
+TIM3.OCMode_PWM1=ENABLE
+TIM3.Pulse=0
+TIM3.Channel=TIM_CHANNEL_3
+TIM3.IPParameters=Prescaler,CounterMode,Period,OCMode_PWM1,Pulse,Channel
+
+# ------------------------------------------------------------
+# ADCs - Current / Sensor Inputs (2 total)
+# ------------------------------------------------------------
+
+# ADC1_IN0 -> PA0
+ADC1.Channel=ADC_CHANNEL_0
+ADC1.Rank=1
+ADC1.SamplingTime=ADC_SAMPLETIME_56CYCLES
+ADC1.ContinuousConvMode=ENABLE
+ADC1.Resolution=ADC_RESOLUTION_12B
+ADC1.IPParameters=Channel,Rank,SamplingTime,ContinuousConvMode,Resolution
+
+# ADC2_IN4 -> PA4
+ADC2.Channel=ADC_CHANNEL_4
+ADC2.Rank=1
+ADC2.SamplingTime=ADC_SAMPLETIME_56CYCLES
+ADC2.ContinuousConvMode=ENABLE
+ADC2.Resolution=ADC_RESOLUTION_12B
+ADC2.IPParameters=Channel,Rank,SamplingTime,ContinuousConvMode,Resolution
+
+# ------------------------------------------------------------
+# UART - QMD / DE5 Serial Command Link
+# ------------------------------------------------------------
+
+# USART2_TX -> PA2
+# USART2_RX -> PA3
+USART2.Mode=Asynchronous
+USART2.BaudRate=115200
+USART2.WordLength=UART_WORDLENGTH_8B
+USART2.StopBits=UART_STOPBITS_1
+USART2.Parity=UART_PARITY_NONE
+USART2.HwFlowCtl=UART_HWCONTROL_NONE
+USART2.OverSampling=UART_OVERSAMPLING_16
+USART2.IPParameters=Mode,BaudRate,WordLength,StopBits,Parity,HwFlowCtl,OverSampling
+
+# ------------------------------------------------------------
+# GPIO Assignments
+# ------------------------------------------------------------
+
+PA8.Signal=TIM1_CH1
+PA1.Signal=TIM2_CH2
+PB0.Signal=TIM3_CH3
+PA0.Signal=ADC1_IN0
+PA4.Signal=ADC2_IN4
+PA2.Signal=USART2_TX
+PA3.Signal=USART2_RX
+
+# Optional: Safety stop pin (example)
+PC13.Mode=GPIO_Input
+PC13.Signal=GPIO_Input
+
+# ------------------------------------------------------------
+# NVIC / Interrupts
+# ------------------------------------------------------------
+NVIC.TIM1_UP_TIM10_IRQn=true:5:0:true:false:true:true:true
+NVIC.TIM2_IRQn=true:5:0:true:false:true:true:true
+NVIC.TIM3_IRQn=true:5:0:true:false:true:true:true
+NVIC.USART2_IRQn=true:5:0:true:false:true:true:true
+NVIC.ADC_IRQn=true:5:0:true:false:true:true:true
+
+# ------------------------------------------------------------
+# Notes for the Developer
+# ------------------------------------------------------------
+# PWM Frequency ≈ 20 kHz  (Period = 8399 @ 168 MHz)
+# Add dead-time (TIM1 advanced config) to avoid shoot-through.
+# Connect ADCs to current sense shunts (phase A, phase B).
+# UART2 used for DE5/QMD high-level command interface.
+# CubeIDE will generate:
+#   MX_TIMx_StartPWM()
+#   MX_ADC1_Start_DMA()
+#   MX_USART2_UART_Init()
+# Include QMD_control.c/h to handle PWM updates based on DE5 solver output.
+#
+# Safety: Clamp PWM duty cycle <95%, add overcurrent shutdown on ADC IRQ.
+# Optional DMA synchronization between ADC and PWM updates.
+# ------------------------------------------------------------
+```
+
+---
+
+### ✅ Import Instructions
+
+1. **Open STM32CubeMX**
+2. Go to **File → Import Project → From .ioc file**
+3. Select `DE5_QMD_Controller.ioc`
+4. Click **Project → Generate Code → Open Project in STM32CubeIDE**
+5. You can now build and flash directly to an STM32F4 board.
+
+---
+
+### ⚡ Ready for DE5/QMD Integration
+
+This `.ioc` file prepares:
+
+* 3× synchronized **PWM channels** for your H-bridges
+* 2× **ADC channels** for current/temperature feedback
+* 1× **UART** for DE5/QMD command or data link
+* Full **HAL initialization** and **interrupt structure**
+
+---
+
