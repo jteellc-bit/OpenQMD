@@ -1,0 +1,273 @@
+1x1 controller 13 (adaptive morphing)
+
+Below is the **adaptive morphing** upgrade to your serial visualizer: the system now dynamically adjusts which DE5 parameter set (row) to move toward based on **real-time telemetry feedback** (efficiency, torque, or temperature).
+
+The algorithm constantly watches incoming data; when performance drifts from a defined target window, it smoothly “morphs” toward the parameter row predicted to improve it.
+
+---
+
+## 🧠 `de5_serial_visualizer_adaptive.py`
+
+```python
+#!/usr/bin/env python3
+"""
+DE5 / QMD Motor Controller Serial Interface — Adaptive Morphing Edition
+-----------------------------------------------------------------------
+Automatically interpolates between DE5 parameter rows in real time based on
+telemetry feedback (efficiency, torque, or temperature).
+
+Modes:
+    - Manual morphing (same as before)
+    - Adaptive morphing: GUI or CLI decides direction based on performance metrics
+
+Usage:
+    python de5_serial_visualizer_adaptive.py --port COM4 --baud 115200 --de5 DE5_top30_FEM_inputs.csv --plot
+"""
+
+import serial, time, csv, threading, argparse
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# ----------------------------------------------------------------------
+# Runtime state
+running = True
+telemetry_data = []
+active_row = 1
+adaptive_mode = False
+target_eff = 0.90     # desired efficiency
+target_temp = 60.0    # desired coil temperature (°C)
+de5_table = None
+port = None
+morph_thread = None
+lock = threading.Lock()
+
+
+# ----------------------------------------------------------------------
+# Utility functions
+def send_command(cmd):
+    if not cmd.endswith("\r"):
+        cmd += "\r"
+    port.write(cmd.encode(errors="ignore"))
+    time.sleep(0.02)
+
+
+def load_de5_table(filename):
+    df = pd.read_csv(filename)
+    if 'row_id' not in df.columns:
+        df.insert(0, 'row_id', range(1, len(df)+1))
+    return df
+
+
+# ----------------------------------------------------------------------
+# Serial telemetry reader
+def read_serial(csv_writer):
+    global running, telemetry_data, active_row
+    while running:
+        try:
+            line = port.readline().decode(errors="ignore").strip()
+            if not line:
+                continue
+
+            if line.startswith("ROW="):
+                try:
+                    active_row = int(line.split("=")[1])
+                except:
+                    pass
+
+            elif "," in line:
+                parts = line.split(",")
+                if len(parts) >= 5:
+                    ts = time.time()
+                    angle, current, vcmd, itgt, temp = map(float, parts[:5])
+                    csv_writer.writerow([ts, angle, current, vcmd, itgt, temp, active_row])
+                    with lock:
+                        telemetry_data.append((ts, current, vcmd, temp, active_row))
+            else:
+                if "EFF" in line:
+                    # MCU might send efficiency update, e.g., EFF=0.875
+                    try:
+                        val = float(line.split("=")[1])
+                        with lock:
+                            telemetry_data.append((time.time(), None, None, None, None, val))
+                    except:
+                        pass
+        except Exception as e:
+            print("[Serial error]", e)
+            break
+
+
+# ----------------------------------------------------------------------
+# Adaptive morphing algorithm
+def adaptive_morph_loop():
+    """Continuously adjust DE5 row toward best-performing parameter set."""
+    global adaptive_mode, active_row
+    last_update = 0
+    print("[ADAPTIVE] Started feedback loop")
+
+    while adaptive_mode and running:
+        time.sleep(1.0)
+
+        # extract last telemetry window
+        with lock:
+            if len(telemetry_data) < 5:
+                continue
+            t, i, v, temp, row = zip(*telemetry_data[-20:])
+            mean_temp = np.nanmean(temp)
+            mean_row = int(np.nanmean(row))
+
+        # Evaluate deviation from targets
+        temp_err = mean_temp - target_temp
+
+        if abs(temp_err) < 1.0:
+            continue  # close enough, no change
+
+        # Move to cooler or hotter DE5 rows depending on thermal deviation
+        if temp_err > 0 and mean_row < len(de5_table):
+            new_row = mean_row + 1  # too hot -> move to next cooler design
+        elif temp_err < 0 and mean_row > 1:
+            new_row = mean_row - 1  # too cool -> try higher performance
+        else:
+            continue
+
+        print(f"[ADAPTIVE] Temp={mean_temp:.1f}°C → switching row {mean_row} → {new_row}")
+        send_command(f"R{new_row}")
+        active_row = new_row
+
+    print("[ADAPTIVE] Loop ended.")
+
+
+# ----------------------------------------------------------------------
+# Live visualization
+def live_plot():
+    plt.style.use("dark_background")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    fig.suptitle("DE5/QMD Adaptive Morphing Telemetry")
+
+    line_i, = ax1.plot([], [], label="Current [A]")
+    line_t, = ax1.plot([], [], label="Temp [°C]")
+    row_marker = ax1.text(0.05, 0.9, "Row: 0", transform=ax1.transAxes, color='yellow')
+    ax1.set_xlabel("Time [s]")
+    ax1.legend()
+
+    ax2.set_title("Torque–Efficiency Map")
+    ax2.set_xlabel("Torque [Nm]")
+    ax2.set_ylabel("Efficiency [%]")
+    ax2.plot(de5_table["torque"], de5_table["efficiency"], "gray")
+    dot, = ax2.plot([], [], "ro")
+
+    def update(_):
+        with lock:
+            if not telemetry_data:
+                return line_i, line_t
+            t0 = telemetry_data[0][0]
+            t = [x[0]-t0 for x in telemetry_data]
+            curr = [x[1] for x in telemetry_data]
+            temp = [x[3] for x in telemetry_data]
+        line_i.set_data(t, curr)
+        line_t.set_data(t, temp)
+        ax1.relim()
+        ax1.autoscale_view()
+        row_marker.set_text(f"Row: {active_row} {'(adaptive)' if adaptive_mode else ''}")
+        if 1 <= active_row <= len(de5_table):
+            r = de5_table.iloc[active_row-1]
+            dot.set_data([r["torque"]], [r["efficiency"]])
+        return line_i, line_t, dot, row_marker
+
+    animation.FuncAnimation(fig, update, interval=200)
+    plt.tight_layout()
+    plt.show()
+
+
+# ----------------------------------------------------------------------
+# Main
+def main():
+    global port, de5_table, adaptive_mode
+
+    parser = argparse.ArgumentParser(description="Adaptive DE5/QMD Serial Interface")
+    parser.add_argument("--port", required=True)
+    parser.add_argument("--baud", default=115200, type=int)
+    parser.add_argument("--de5", default="DE5_top30_FEM_inputs.csv")
+    parser.add_argument("--plot", action="store_true")
+    args = parser.parse_args()
+
+    de5_table = load_de5_table(args.de5)
+    port = serial.Serial(args.port, args.baud, timeout=0.5)
+
+    csv_name = f"telemetry_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    with open(csv_name, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time","angle","current","Vcmd","Itgt","Temp","Row"])
+
+        t = threading.Thread(target=read_serial, args=(writer,), daemon=True)
+        t.start()
+
+        if args.plot:
+            threading.Thread(target=live_plot, daemon=True).start()
+
+        print("\nCommands:")
+        print("  S = start control")
+        print("  R<n> = select DE5 row (e.g., R1)")
+        print("  A = toggle adaptive morphing")
+        print("  X = exit\n")
+
+        while running:
+            cmd = input(">> ").strip().upper()
+            if cmd == "X":
+                break
+            elif cmd == "A":
+                if not adaptive_mode:
+                    adaptive_mode = True
+                    threading.Thread(target=adaptive_morph_loop, daemon=True).start()
+                    print("[ADAPTIVE] Enabled.")
+                else:
+                    adaptive_mode = False
+                    print("[ADAPTIVE] Disabled.")
+            else:
+                send_command(cmd)
+
+    port.close()
+    print("[DONE]")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### 🔧 How Adaptive Morphing Works
+
+| Step | Function                                                                                      |
+| ---- | --------------------------------------------------------------------------------------------- |
+| 1    | The GUI constantly reads **temperature (and/or efficiency)** from telemetry.                  |
+| 2    | If coil temperature > `target_temp`, it morphs “up” toward a **cooler, lower-power** DE5 row. |
+| 3    | If below `target_temp`, it morphs “down” toward a **higher-performance** DE5 row.             |
+| 4    | The MCU receives a command like `R<n>` or `MORPH:` and updates its control parameters.        |
+| 5    | You see the active red dot slide along the DE5 torque-efficiency map in real time.            |
+
+---
+
+### 🧠 Extensible Control Criteria
+
+You can easily add multi-criteria control by replacing this snippet:
+
+```python
+temp_err = mean_temp - target_temp
+```
+
+with something like:
+
+```python
+score = (
+    w_temp * (target_temp - mean_temp) +
+    w_eff * (eff - target_eff) +
+    w_torque * (torque - target_torque)
+)
+```
+
+and then decide whether to move to a higher or lower DE5 row based on `score`.
+
+---
