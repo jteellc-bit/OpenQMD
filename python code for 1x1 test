@@ -1,0 +1,336 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error
+from itertools import product
+import pickle
+import json
+from datetime import datetime, timezone
+import math
+from joblib import Parallel, delayed
+
+# --- Configuration and Output Directory ---
+out_dir = '/mnt/data/DE5_local_resweep_packaged'
+os.makedirs(out_dir, exist_ok=True)
+print(f"Output directory: {out_dir}")
+
+# --- Global Constants and Thresholds ---
+alpha_sat = 0.20   # smooth saturation shaping coefficient (dimensionless)
+I_sat = 200.0      # saturation current scale in amps
+B_sat = 1.7        # Tesla (approx ferromagnetic soft saturation)
+AMBIENT_C = 25.0
+TMAX_ALLOWED_C = 120.0
+THERMAL_MARGIN_REQ_C = 20.0   # require margin of 20°C below Tmax
+I_REQ_THRESHOLD_A = 500.0     # practical wiring limit
+EFF_HIGH_THRESH = 0.80
+sigma_eff = 0.03 # Defined for efficiency adjustment
+
+thermal_resistance_map = {
+    'Baseline': 0.001,  # K/W
+    'Graphite Spreader': 0.0005, # K/W
+    'Heat-pipe hybrid': 0.0001   # K/W
+}
+
+batteries = {
+    'B1_48V': {'V':48, 'I_cont_A':60,  'I_peak_A':100},
+    'B2_96V': {'V':96, 'I_cont_A':100, 'I_peak_A':250},
+    'B3_EV_avg': {'V':400, 'I_cont_A':300, 'I_peak_A':700},
+    'Mains_120V': {'V':120, 'I_cont_A':20, 'I_peak_A':30},
+    'Mains_240V': {'V':240, 'I_cont_A':30, 'I_peak_A':45}
+}
+
+# --- Physics Evaluator Function ---
+def eval_motor_proxy(params, I_req=None, cooling_type='Baseline', copper_loss_reduction_factor=1.0):
+    D_mm = float(params['coil_diam_mm'])
+    g_mm = float(params['air_gap_mm'])
+    p = int(params['poles'])
+    N = int(params['turns'])
+    I = float(I_req) if I_req is not None else 10.0
+
+    D_m = D_mm / 1000.0
+    g_m = g_mm / 1000.0
+
+    area_m2 = np.pi * (D_m/2.0)**2
+    M_H = 1e-6 * area_m2 * (N**2) / (g_m + 1e-3)
+    pred_torque_Nm = M_H * 50.0
+
+    R_winding = (0.00005 * copper_loss_reduction_factor) * N * (D_mm / 100)
+    P_copper_W = (I**2) * R_winding
+
+    nominal_speed_rad_s = 100
+    P_core_W = 0.000005 * p * nominal_speed_rad_s * (N / g_mm)
+    P_windage_W = 0.005 * nominal_speed_rad_s
+    P_loss_W = P_copper_W + P_core_W + P_windage_W
+
+    P_out_W = pred_torque_Nm * nominal_speed_rad_s
+    P_out_W = max(P_out_W, 1e-6)
+
+    pred_efficiency = P_out_W / (P_out_W + P_loss_W)
+    pred_efficiency = np.clip(pred_efficiency, 0, 1)
+
+    thermal_resistance_coefficient = thermal_resistance_map.get(cooling_type, 0.001)
+    deltaT_C = P_loss_W * thermal_resistance_coefficient
+
+    coil_temp_est_C = AMBIENT_C + deltaT_C
+    thermal_margin_C = TMAX_ALLOWED_C - coil_temp_est_C
+
+    k_t = pred_torque_Nm / I if I != 0 else 0.0
+    I_req_A = I
+
+    thermal_ok = thermal_margin_C > THERMAL_MARGIN_REQ_C
+    I_req_reasonable = I_req_A < I_REQ_THRESHOLD_A
+    eff_high = pred_efficiency > EFF_HIGH_THRESH
+    prototype_ready = thermal_ok and I_req_reasonable and (pred_efficiency > 0.70)
+
+    return {
+        'coil_diam_mm': D_mm, 'air_gap_mm': g_mm, 'poles': p, 'turns': N,
+        'M_H': float(M_H),
+        'pred_torque_Nm': float(pred_torque_Nm),
+        'pred_efficiency': float(pred_efficiency),
+        'k_t': float(k_t),
+        'I_req_A': float(I_req_A),
+        'P_copper_W': float(P_copper_W),
+        'P_core_W': float(P_core_W),
+        'P_windage_W': float(P_windage_W),
+        'P_loss_W': float(P_loss_W),
+        'P_out_W': float(P_out_W),
+        'deltaT_C': float(deltaT_C),
+        'area_m2': float(area_m2),
+        'coil_temp_est_C': float(coil_temp_est_C),
+        'thermal_margin_C': float(thermal_margin_C),
+        'thermal_ok': bool(thermal_ok),
+        'I_req_reasonable': bool(I_req_reasonable),
+        'eff_high': bool(eff_high),
+        'prototype_ready': bool(prototype_ready)
+    }
+
+# --- Grid Generation ---
+center = {
+    "coil_diam_mm": 415.172967,
+    "air_gap_mm": 0.590523,
+    "poles": 2,
+    "turns": 810
+}
+
+diam_min = 350.0
+diam_max = 480.0
+diam_steps = 15
+diam_vals = np.linspace(diam_min, diam_max, diam_steps)
+
+gap_min = 0.3
+gap_max = 0.9
+gap_steps = 15
+gap_vals = np.linspace(gap_min, gap_max, gap_steps)
+
+turns_min = 700
+turns_max = 900
+turns_steps = 10
+turns_vals = np.linspace(turns_min, turns_max, turns_steps, dtype=int)
+
+poles_vals = np.array([2, 3, 4, 5])
+
+def make_local_grid(center, diam_span=200.0, diam_steps=9, gap_span=0.6, gap_steps=6, turn_pct=0.25, poles_list=None):
+    if poles_list is None:
+        poles_list = [2,3,4,5]
+    diam_vals = np.linspace(center['coil_diam_mm'] - diam_span/2.0, center['coil_diam_mm'] + diam_span/2.0, diam_steps)
+    gap_vals = np.linspace(max(0.2, center['air_gap_mm'] - gap_span/2.0), center['air_gap_mm'] + gap_span/2.0, gap_steps)
+    turns_low = max(10, int(center['turns'] * (1.0 - turn_pct)))
+    turns_high = max(turns_low+1, int(center['turns'] * (1.0 + turn_pct)))
+    turn_vals = np.unique(np.round(np.linspace(turns_low, turns_high, max(5, int(turn_pct*20))))) # Corrected: Removed extra ')'
+    turn_vals = turn_vals.astype(int)
+    grid = []
+    for D in diam_vals:
+        for g in gap_vals:
+            for p in poles_list:
+                for N in turn_vals:
+                    grid.append({'coil_diam_mm': float(D), 'air_gap_mm': float(g), 'poles': int(p), 'turns': int(N)})
+    return grid
+
+# build grid (tunable)
+grid = make_local_grid(center, diam_span=diam_span, diam_steps=diam_steps, gap_span=gap_span, gap_steps=gap_steps, turn_pct=turn_pct, poles_list=poles_vals)
+print("Grid points:", len(grid))
+
+# --- Evaluation Loop ---
+def evaluate_point(pt, battery_key, I_mode='cont', cooling_type='Baseline', copper_loss_reduction_factor=1.0):
+    bcfg = batteries[battery_key]
+    I_val = bcfg['I_cont_A'] if I_mode == 'cont' else bcfg['I_peak_A']
+    res = eval_motor_proxy(pt, I_req=I_val, cooling_type=cooling_type, copper_loss_reduction_factor=copper_loss_reduction_factor)
+    res.update({'battery': battery_key, 'I_mode': I_mode})
+    return {**pt, **res}
+
+def evaluate_grid(grid, battery_keys, I_mode='cont', n_jobs=1, cooling_type='Baseline', copper_loss_reduction_factor=1.0):
+    if n_jobs == 1:
+        rows = []
+        for pt in grid:
+            for bk in battery_keys:
+                rows.append(evaluate_point(pt, bk, I_mode=I_mode, cooling_type=cooling_type, copper_loss_reduction_factor=copper_loss_reduction_factor))
+    else:
+        tasks = []
+        for pt in grid:
+            for bk in battery_keys:
+                tasks.append((pt, bk, I_mode, cooling_type, copper_loss_reduction_factor))
+        processed = Parallel(n_jobs=n_jobs)(delayed(lambda arg: evaluate_point(*arg))(t) for t in tasks)
+        rows = processed
+    return pd.DataFrame(rows)
+
+# --- Pareto Front Computation ---
+def is_pareto_efficient(costs):
+    is_efficient = np.ones(costs.shape[0], dtype=bool)
+    for i in range(costs.shape[0]):
+        if is_efficient[i]:
+            at_least_as_good = np.all(costs >= costs[i], axis=1)
+            strictly_better_in_one = np.any(costs > costs[i], axis=1)
+            dominates_i = at_least_as_good & strictly_better_in_one
+            if np.any(dominates_i):
+                is_efficient[i] = False
+    return is_efficient
+
+def compute_pareto(df):
+    vals = df[['pred_torque_Nm','pred_efficiency']].values
+    mask = is_pareto_efficient(vals)
+    df['pareto'] = mask
+    pareto_df = df[mask].sort_values(by='pred_torque_Nm', ascending=False)
+    return pareto_df
+
+# --- Surrogate Training ---
+def train_surrogate_models(df, feature_cols=['coil_diam_mm','air_gap_mm','poles','turns','I_req_A'], targets=['pred_torque_Nm','pred_efficiency']):
+    X = df[feature_cols].values
+    models = {}
+    for t in targets:
+        y = df[t].values
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        rf = RandomForestRegressor(n_estimators=300, min_samples_leaf=3, n_jobs=-1, random_state=42)
+        rf.fit(X_train, y_train)
+        y_pred = rf.predict(X_test)
+        r2 = r2_score(y_test, y_pred)
+        models[t] = {'model': rf, 'r2_test': r2}
+    return models
+
+# --- Export Helpers ---
+def export_topN_fem(df, topN=30, path=None):
+    if path is None:
+        path = os.path.join(out_dir, f'DE5_top{topN}_FEM_inputs.csv')
+    top = df.sort_values(['pred_torque_Nm','pred_efficiency'], ascending=False).head(topN)
+    cols = ['coil_diam_mm','air_gap_mm','poles','turns','I_req_A','pred_torque_Nm','pred_efficiency','P_loss_W','coil_temp_est_C']
+    top[cols].to_csv(path, index=False)
+    return path
+
+# --- Visualization ---
+def plot_pareto(df, outpath=None):
+    plt.figure(figsize=(8,6))
+    sc = plt.scatter(df['pred_torque_Nm'], df['pred_efficiency'], c=df['coil_diam_mm'], cmap='viridis', s=25, alpha=0.85)
+    plt.colorbar(sc, label='coil_diam_mm (mm)')
+    plt.xlabel('Predicted Torque (Nm)')
+    plt.ylabel('Predicted Efficiency')
+    plt.title('Local region: Torque vs Efficiency (color=diameter)')
+    if outpath:
+        plt.savefig(outpath, dpi=200, bbox_inches='tight')
+    plt.close()
+
+# --- Main Pipeline Function ---
+def run_local_pipeline(grid, batteries, run_continuous=True, run_peak=False, n_jobs=4, demo_mode=False, cooling_type='Baseline', copper_loss_reduction_factor=1.0):
+    frames = []
+    print(f"Starting evaluation. Points: {len(grid)}, batteries: {list(batteries.keys())}, Cooling Type: {cooling_type}, Copper Loss Reduction Factor: {copper_loss_reduction_factor}")
+    if run_continuous:
+        print("- evaluating continuous currents")
+        df_cont = evaluate_grid(grid, list(batteries.keys()), I_mode='cont', n_jobs=n_jobs, cooling_type=cooling_type, copper_loss_reduction_factor=copper_loss_reduction_factor)
+        frames.append(df_cont)
+    if run_peak:
+        print("- evaluating peak currents")
+        df_peak = evaluate_grid(grid, list(batteries.keys()), I_mode='peak', n_jobs=n_jobs, cooling_type=cooling_type, copper_loss_reduction_factor=copper_loss_reduction_factor)
+        frames.append(df_peak)
+    df_all = pd.concat(frames, ignore_index=True)
+
+    # NEW POST-PROCESSING STEP
+    df_all['pred_efficiency_adjusted'] = df_all['pred_efficiency'] - (3 * sigma_eff)
+    df_all['pred_efficiency_adjusted'] = np.clip(df_all['pred_efficiency_adjusted'], 0.0, 1.0)
+
+    eff_adjusted_safe = np.where(df_all['pred_efficiency_adjusted'] < 1e-6, 1e-6, df_all['pred_efficiency_adjusted'])
+    df_all['P_loss_W'] = df_all['P_out_W'] * (1 / eff_adjusted_safe - 1)
+    df_all['P_loss_W'] = np.maximum(df_all['P_loss_W'], 0)
+
+    df_all['deltaT_C'] = df_all['P_loss_W'] * thermal_resistance_map.get(cooling_type, 0.001)
+    df_all['coil_temp_est_C'] = AMBIENT_C + df_all['deltaT_C']
+    df_all['thermal_margin_C'] = TMAX_ALLOWED_C - df_all['coil_temp_est_C']
+
+    df_all['thermal_ok'] = df_all['thermal_margin_C'] > THERMAL_MARGIN_REQ_C
+    df_all['I_req_reasonable_flag'] = df_all['I_req_A'] < I_REQ_THRESHOLD_A
+    df_all['eff_high'] = df_all['pred_efficiency_adjusted'] > EFF_HIGH_THRESH
+    df_all['prototype_ready'] = df_all['thermal_ok'] & df_all['I_req_reasonable_flag'] & (df_all['eff_high'])
+
+    pareto_df = compute_pareto(df_all)
+    top30_path = export_topN_fem(df_all, topN=30, path=os.path.join(out_dir,f'DE5_top30_FEM_inputs_{cooling_type}.csv'))
+    top10_path = export_topN_fem(df_all, topN=10, path=os.path.join(out_dir,f'DE5_top10_FEM_inputs_{cooling_type}.csv'))
+
+    num_points_in_df = len(df_all)
+    n_for_sample = min(num_points_in_df, 3000)
+    sample_df = df_all.sample(n=n_for_sample, random_state=42)
+    surrogates = train_surrogate_models(sample_df)
+
+    pareto_plot_path = os.path.join(out_dir, f'DE5_par_scatter_{cooling_type}.png')
+    plot_pareto(df_all, outpath=pareto_plot_path)
+
+    surface_plot_path = os.path.join(out_dir, f"DE5_local_surface_{cooling_type}_{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")}.png")
+    # The original surface plot generation was commented out, so this is a placeholder path.
+    # If actual surface plot generation is desired, implement it here.
+    
+    df_all.to_csv(os.path.join(out_dir,f'DE5_pareto_with_thermal_metrics_{cooling_type}.csv'), index=False)
+    pareto_df.to_csv(os.path.join(out_dir,f'DE5_pareto_front_{cooling_type}.csv'), index=False)
+
+    info = {
+        'df_all_path': os.path.join(out_dir,f'DE5_pareto_with_thermal_metrics_{cooling_type}.csv'),
+        'pareto_path': os.path.join(out_dir,f'DE5_pareto_front_{cooling_type}.csv'),
+        'top30_fem': top30_path,
+        'top10_fem': top10_path,
+        'surrogate_r2': {k:v['r2_test'] for k,v in surrogates.items()},
+        'n_points': len(df_all),
+        'pareto_plot': pareto_plot_path,
+        'surface_plot': surface_plot_path
+    }
+    return info, df_all, pareto_df, surrogates
+
+# --- Main Execution ---
+if __name__ == '__main__':
+    import time
+    from IPython.display import display
+
+    print("DE5 local re-sweep helper script.")
+    print(f"Outputs will be saved to: {out_dir}")
+
+    RUN_FULL_SWEEP = True
+    N_JOBS = 8
+
+    if RUN_FULL_SWEEP:
+        final_grid = grid
+        print(f"Running FULL local sweep with {len(final_grid)} grid points.")
+    else:
+        demo_grid_size = min(len(grid), 20)
+        final_grid = grid[:demo_grid_size]
+        print(f"Running DEMO local sweep with {len(final_grid)} grid points.")
+
+    start = time.time()
+
+    selected_batteries = batteries
+
+    cooling_types_to_evaluate = ['Baseline', 'Graphite Spreader', 'Heat-pipe hybrid']
+    all_cooling_results = []
+
+    for c_type in cooling_types_to_evaluate:
+        print(f"\n--- Evaluating with cooling_type: {c_type} ---")
+        info_c, df_all_c, pareto_df_c, surrogates_c = run_local_pipeline(final_grid, selected_batteries, run_continuous=True, run_peak=False, n_jobs=N_JOBS, demo_mode=(not RUN_FULL_SWEEP), cooling_type=c_type, copper_loss_reduction_factor=1.0)
+        all_cooling_results.append((info_c, df_all_c, pareto_df_c, surrogates_c))
+
+        print(f"Done. Time (s): {round(time.time()-start,2)}")
+        print("Outputs:", json.dumps(info_c, indent=2))
+        print(f"Surrogate R2 (demo): {info_c['surrogate_r2']}")
+        print("Preview of top pareto rows:")
+        display_cols = ['coil_diam_mm','air_gap_mm','poles','turns','I_req_A','pred_torque_Nm','pred_efficiency','P_loss_W','coil_temp_est_C','thermal_ok','thermal_margin_C', 'prototype_ready']
+        display(pareto_df_c[display_cols].head(10))
+
+    info, df_all, pareto_df, surrogates = all_cooling_results[-1]
+
+    if not RUN_FULL_SWEEP:
+        print("\nTo run the full local sweep, set RUN_FULL_SWEEP=True then re-run this cell.")
