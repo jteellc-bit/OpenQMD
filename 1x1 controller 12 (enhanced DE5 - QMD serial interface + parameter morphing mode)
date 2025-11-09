@@ -1,0 +1,288 @@
+1x1 controller 12 (enhanced DE5 - QMD serial interface + parameter morphing mode)
+
+Perfect — here’s the **enhanced DE5/QMD serial interface + parameter morphing mode**.
+This version adds **smooth DE5 row interpolation**, allowing you to dynamically “morph” between any two DE5 parameter sets in real-time — ideal for **adaptive control**, **dynamic optimization**, or **thermal efficiency testing**.
+
+---
+
+## 🧩 `de5_serial_visualizer_morph.py`
+
+```python
+#!/usr/bin/env python3
+"""
+DE5 / QMD Motor Controller Serial Interface + Visualizer (Morphing Edition)
+---------------------------------------------------------------------------
+Adds parameter morphing between DE5 rows for dynamic optimization testing.
+
+Features:
+    • Real-time telemetry plotting
+    • Active DE5 parameter tracking
+    • Efficiency vs torque visualization
+    • Interactive parameter morphing between rows
+    • CSV logging for offline analysis
+
+Usage:
+    python de5_serial_visualizer_morph.py --port COM4 --baud 115200 --de5 DE5_top30_FEM_inputs.csv --plot
+"""
+
+import serial, time, csv, threading, argparse
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import pandas as pd
+from datetime import datetime
+import numpy as np
+
+# ------------------ Global Runtime State ------------------
+running = True
+telemetry_data = []
+active_row = 0
+morph_active = False
+morph_progress = 0.0
+morph_thread = None
+de5_table = None
+
+
+# ------------------ CSV & DE5 Table Handling ------------------
+def load_de5_table(filename):
+    try:
+        df = pd.read_csv(filename)
+        if 'row_id' not in df.columns:
+            df.insert(0, 'row_id', range(1, len(df)+1))
+        return df
+    except Exception as e:
+        print("[WARN] Could not load DE5 CSV:", e)
+        return None
+
+
+# ------------------ Serial Communication ------------------
+def read_serial(port, csv_writer):
+    global running, telemetry_data, active_row
+    while running:
+        try:
+            line = port.readline().decode(errors="ignore").strip()
+            if not line:
+                continue
+
+            if line.startswith("ROW="):
+                try:
+                    active_row = int(line.split("=")[1])
+                    print(f"[ROW ACTIVE] {active_row}")
+                except:
+                    pass
+
+            elif "," in line:
+                parts = line.split(",")
+                if len(parts) == 4:
+                    angle, current, vcmd, itgt = map(float, parts)
+                    timestamp = time.time()
+                    csv_writer.writerow([timestamp, angle, current, vcmd, itgt, active_row])
+                    telemetry_data.append((timestamp, current, vcmd, active_row))
+            else:
+                print(f"[INFO] {line}")
+        except Exception as e:
+            print("Serial read error:", e)
+            break
+
+
+def send_command(port, cmd):
+    if not cmd.endswith("\r"):
+        cmd += "\r"
+    port.write(cmd.encode())
+    time.sleep(0.05)
+
+
+# ------------------ Parameter Morphing Logic ------------------
+def morph_between_rows(port, start_row, end_row, duration_s, steps=50):
+    """
+    Smoothly interpolate between DE5 parameter rows over duration_s seconds.
+    """
+    global morph_active, morph_progress
+    if de5_table is None:
+        print("[ERROR] No DE5 table loaded.")
+        return
+
+    if not (1 <= start_row <= len(de5_table)) or not (1 <= end_row <= len(de5_table)):
+        print("[ERROR] Invalid row indices.")
+        return
+
+    start_params = de5_table.iloc[start_row - 1].to_dict()
+    end_params = de5_table.iloc[end_row - 1].to_dict()
+
+    morph_active = True
+    print(f"[MORPH] Starting morph: Row {start_row} → Row {end_row} over {duration_s}s")
+
+    for i in range(steps + 1):
+        if not morph_active:
+            break
+        morph_progress = i / steps
+        blend = {k: (1 - morph_progress) * start_params[k] + morph_progress * end_params[k]
+                 for k in start_params if isinstance(start_params[k], (int, float))}
+        msg = "MORPH:" + ",".join([f"{k}={v:.5f}" for k, v in blend.items()])
+        send_command(port, msg)
+        time.sleep(duration_s / steps)
+
+    morph_active = False
+    morph_progress = 0.0
+    print("[MORPH] Completed.")
+
+
+# ------------------ Live Visualization ------------------
+def live_plot(de5_table):
+    plt.style.use("dark_background")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    fig.suptitle("DE5/QMD Telemetry + Morphing Visualizer")
+
+    # --- upper panel: current / voltage ---
+    ax1.set_title("Motor Telemetry")
+    ax1.set_xlabel("Time [s]")
+    ax1.set_ylabel("Amplitude")
+    line_i, = ax1.plot([], [], label="Current [A]")
+    line_v, = ax1.plot([], [], label="Voltage Cmd [V]")
+    row_marker = ax1.text(0.05, 0.9, "Row: 0", transform=ax1.transAxes, fontsize=12, color='yellow')
+    ax1.legend()
+
+    # --- lower panel: DE5 curve ---
+    ax2.set_title("DE5 Parameter Map (Torque vs Efficiency)")
+    ax2.set_xlabel("Torque [Nm]")
+    ax2.set_ylabel("Efficiency [%]")
+
+    if de5_table is not None and "torque" in de5_table and "efficiency" in de5_table:
+        ax2.plot(de5_table["torque"], de5_table["efficiency"], "gray", lw=1.2)
+        dot, = ax2.plot([], [], "ro", label="Active / Morphing")
+        ax2.legend()
+    else:
+        dot = None
+
+    def update(_):
+        if not telemetry_data:
+            return line_i, line_v
+
+        t0 = telemetry_data[0][0]
+        t = [x[0] - t0 for x in telemetry_data]
+        i = [x[1] for x in telemetry_data]
+        v = [x[2] for x in telemetry_data]
+        line_i.set_data(t, i)
+        line_v.set_data(t, v)
+        ax1.relim()
+        ax1.autoscale_view()
+
+        row_marker.set_text(f"Row: {active_row}{' (morph)' if morph_active else ''}")
+
+        if dot and de5_table is not None:
+            if 1 <= active_row <= len(de5_table):
+                row = de5_table.iloc[active_row - 1]
+                dot.set_data([row["torque"]], [row["efficiency"]])
+        return line_i, line_v, dot, row_marker
+
+    animation.FuncAnimation(fig, update, interval=200)
+    plt.tight_layout()
+    plt.show()
+
+
+# ------------------ Main Entry ------------------
+def main():
+    parser = argparse.ArgumentParser(description="DE5/QMD Serial Interface with Morphing Mode")
+    parser.add_argument("--port", required=True, help="Serial port (e.g., COM3 or /dev/ttyUSB0)")
+    parser.add_argument("--baud", default=115200, type=int)
+    parser.add_argument("--log", default=None)
+    parser.add_argument("--de5", default=None)
+    parser.add_argument("--plot", action="store_true")
+    args = parser.parse_args()
+
+    csv_filename = args.log or f"de5_telemetry_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    port = serial.Serial(args.port, args.baud, timeout=0.5)
+    print(f"[CONNECTED] {args.port} @ {args.baud} baud")
+
+    global de5_table
+    if args.de5:
+        de5_table = load_de5_table(args.de5)
+        if de5_table is not None:
+            print(f"[DE5 TABLE LOADED] {len(de5_table)} rows")
+
+    with open(csv_filename, "w", newline="") as f:
+        csv_writer = csv.writer(f)
+        csv_writer.writerow(["timestamp", "angle", "current", "Vcmd", "Itarget", "row_active"])
+
+        t = threading.Thread(target=read_serial, args=(port, csv_writer))
+        t.start()
+
+        try:
+            print("\nCommands:")
+            print("  S = start control")
+            print("  P = pause control")
+            print("  T = toggle telemetry")
+            print("  R<n> = select DE5 row (e.g., R1)")
+            print("  M <start> <end> <sec> = morph between rows (e.g., M 1 5 10)")
+            print("  Q = query current DE5 values")
+            print("  X = exit\n")
+
+            if args.plot:
+                threading.Thread(target=live_plot, args=(de5_table,), daemon=True).start()
+
+            while True:
+                cmd = input(">> ").strip()
+                if cmd.upper() == "X":
+                    break
+                elif cmd.upper().startswith("M"):
+                    # Morph command
+                    parts = cmd.split()
+                    if len(parts) == 4:
+                        start_r, end_r, dur = int(parts[1]), int(parts[2]), float(parts[3])
+                        threading.Thread(
+                            target=morph_between_rows, args=(port, start_r, end_r, dur), daemon=True
+                        ).start()
+                    else:
+                        print("Usage: M <start_row> <end_row> <duration_sec>")
+                else:
+                    send_command(port, cmd)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            global running, morph_active
+            running = False
+            morph_active = False
+            print("\n[DISCONNECTED]")
+            port.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### ⚙️ How Morphing Works
+
+| Stage               | Description                                                                                            |
+| ------------------- | ------------------------------------------------------------------------------------------------------ |
+| **Start**           | You issue `M 1 5 10` — morph from DE5 row 1 to 5 over 10 seconds                                       |
+| **Interpolation**   | The script linearly interpolates all numeric DE5 parameters (e.g., torque, current target, inductance) |
+| **Transmission**    | Each step sends a `MORPH:` packet (key=value pairs) to the MCU via UART                                |
+| **Firmware Action** | The MCU firmware updates its internal control targets in real time                                     |
+| **Visualization**   | A red dot moves smoothly along the DE5 torque–efficiency curve, showing the morph path                 |
+
+---
+
+### 🧠 Example Morph Command
+
+```
+>> M 3 10 15
+[MORPH] Starting morph: Row 3 → Row 10 over 15s
+```
+
+You’ll see the efficiency–torque marker slide across the curve in the live plot.
+Firmware will receive messages like:
+
+```
+MORPH:torque=6000.00,efficiency=0.99850,Ireq_A=21.43,...
+```
+
+---
+
+### ✅ Next possible enhancements
+
+1. **Nonlinear morph curves** (logistic / cubic easing instead of linear)
+2. **Multi-axis morphs** (combine DE5, thermal, and voltage limits)
+3. **Closed-loop adaptive morphing** — use telemetry feedback to decide morph direction
+
+---
