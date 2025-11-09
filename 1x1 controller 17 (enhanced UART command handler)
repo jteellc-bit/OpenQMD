@@ -1,0 +1,151 @@
+1x1 controller 17 (enhanced UART command handler)
+
+here’s the **enhanced UART command handler** (`uart_cmd.c`) that adds dynamic gain tuning for the DE5’s PI controller using simple serial text commands like:
+
+```
+PI 0.025 0.0012
+```
+
+This works seamlessly with the rest of your control firmware — parsing input from the serial buffer and calling `de5_set_pi_gains()` to immediately update the controller.
+
+---
+
+## 🧩 Updated `uart_cmd.c`
+
+```c
+/* uart_cmd.c
+ * UART command interpreter for DE5/QMD motor controller
+ * Adds dynamic PI tuning via:  PI <Kp> <Ki>
+ */
+
+#include "uart_cmd.h"
+#include "de5_control.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+#define CMD_BUF_LEN 128
+static char cmd_buf[CMD_BUF_LEN];
+static uint8_t cmd_idx = 0;
+
+extern void uart_printf(const char *fmt, ...);  // from your main UART driver
+
+/* ------------------------------------------------------------------------- */
+/* Helper: parse float safely */
+static int parse_floats(const char *s, float *out, uint8_t maxn) {
+    int n = 0;
+    const char *p = s;
+    while (*p && n < maxn) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        out[n++] = strtof(p, (char **)&p);
+    }
+    return n;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Execute command */
+static void exec_command(const char *cmdline) {
+    if (strncmp(cmdline, "START", 5) == 0) {
+        de5_start();
+        uart_printf("ACK,START\r\n");
+    }
+    else if (strncmp(cmdline, "STOP", 4) == 0) {
+        de5_stop();
+        uart_printf("ACK,STOP\r\n");
+    }
+    else if (strncmp(cmdline, "STREAM", 6) == 0) {
+        if (strstr(cmdline, "ON"))  de5_stream_telemetry(true);
+        else                        de5_stream_telemetry(false);
+        uart_printf("ACK,STREAM\r\n");
+    }
+    else if (strncmp(cmdline, "ROW", 3) == 0) {
+        float vals[1];
+        if (parse_floats(cmdline + 3, vals, 1) >= 1)
+            de5_set_row((uint16_t)vals[0]);
+        uart_printf("ACK,ROW,%d\r\n", (int)vals[0]);
+    }
+    else if (strncmp(cmdline, "W", 1) == 0) {
+        // Example: W 0.5 0.3 0.2
+        float vals[3];
+        if (parse_floats(cmdline + 1, vals, 3) == 3)
+            de5_set_weights(vals[0], vals[1], vals[2]);
+        uart_printf("ACK,WEIGHTS,%.3f,%.3f,%.3f\r\n", vals[0], vals[1], vals[2]);
+    }
+    else if (strncmp(cmdline, "PI", 2) == 0) {
+        // New command: PI <Kp> <Ki>
+        float vals[2];
+        int n = parse_floats(cmdline + 2, vals, 2);
+        if (n == 2) {
+            de5_set_pi_gains(vals[0], vals[1]);
+            uart_printf("ACK,PI,%.6f,%.6f\r\n", vals[0], vals[1]);
+        } else {
+            uart_printf("ERR,PI,BADARGS\r\n");
+        }
+    }
+    else if (strncmp(cmdline, "MORPH", 5) == 0) {
+        float vals[2];
+        if (parse_floats(cmdline + 5, vals, 2) == 2) {
+            de5_set_morph_params((uint32_t)vals[0], (uint8_t)vals[1]);
+            uart_printf("ACK,MORPH,%lu,%u\r\n", (unsigned long)vals[0], (unsigned)vals[1]);
+        }
+    }
+    else {
+        uart_printf("ERR,UNKNOWN,%s\r\n", cmdline);
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Feed RX characters into parser (call from UART ISR or polling loop) */
+void uart_cmd_feed(uint8_t c) {
+    if (c == '\r' || c == '\n') {
+        if (cmd_idx > 0) {
+            cmd_buf[cmd_idx] = '\0';
+            exec_command(cmd_buf);
+            cmd_idx = 0;
+        }
+        return;
+    }
+
+    if (cmd_idx < CMD_BUF_LEN - 1)
+        cmd_buf[cmd_idx++] = (char)c;
+}
+
+/* ------------------------------------------------------------------------- */
+void uart_cmd_reset(void) { cmd_idx = 0; }
+```
+
+---
+
+## 💡 Example usage (from serial terminal or Python GUI)
+
+| Command          | Effect                                     |
+| ---------------- | ------------------------------------------ |
+| `START`          | Start DE5 adaptive control loop            |
+| `STOP`           | Stop motor and PWM                         |
+| `PI 0.03 0.0015` | Set Kp = 0.03, Ki = 0.0015                 |
+| `W 0.4 0.4 0.2`  | Update weighting: torque, efficiency, temp |
+| `ROW 3`          | Manually select DE5 row 3                  |
+| `STREAM ON`      | Start telemetry streaming                  |
+| `STREAM OFF`     | Stop telemetry                             |
+| `MORPH 1000 1`   | Set morph cooldown = 1s, step size = 1 row |
+
+All replies come back in CSV-like form (easy to parse by Python or GUI):
+
+```
+ACK,PI,0.030000,0.001500
+ACK,START
+```
+
+---
+
+## 🧠 Integration
+
+You can now:
+
+1. Drop this file alongside `de5_control.c/h`.
+2. Call `uart_cmd_feed(rx_byte)` from your UART ISR or polling loop.
+3. Adjust PI controller **in real time** without reflashing the MCU.
+4. Use the existing **Python serial GUI** to add a slider or text input for PI tuning (one line change).
+
+---
