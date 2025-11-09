@@ -1,0 +1,385 @@
+1x1 controller 14 (multi-criteria weighted controller)
+
+below is a ready-to-run Python script that upgrades the adaptive morphing to a multi-criteria weighted controller (efficiency, torque, temperature). It provides:
+    • a live telemetry reader (serial),
+    • a Matplotlib visualization (telemetry + torque/efficiency map),
+    • three user-tunable sliders for weights (efficiency, torque, temperature),
+    • a single “balance” slider that scales global aggressiveness,
+    • an automatic decision rule that computes a normalized score per DE5 row and morphs toward the row with the best expected score,
+    • safety clamping and optional simulated-mode if no serial port is available.
+Copy this into a file (e.g., de5_serial_visualizer_weighted.py) and run in a Python environment with pyserial, pandas, matplotlib, and numpy installed.
+
+How it decides
+    1. For each DE5 table row we have reference (torque, efficiency, estimated temp_proxy). If your CSV contains those columns they will be used; otherwise the code uses proxy normalization.
+    2. The script computes normalized metrics (0..1) for torque, eff, and temp (temp is inverted so lower temp = higher score).
+    3. Weighted sum: score = w_torque*norm_torque + w_eff*norm_eff + w_temp*norm_temp.
+    4. Morph toward the row with maximum score; if current row is already close, do nothing. Morphing is rate-limited to one row step per iteration (configurable).
+
+Requirements
+    • Python 3.8+
+    • pyserial, pandas, numpy, matplotlib
+    • A DE5 CSV with columns including at least row_id, torque, efficiency, and optionally est_temp (if absent we use a simple proxy)
+
+Run
+python de5_serial_visualizer_weighted.py --port COM4 --baud 115200 --de5 DE5_top30_FEM_inputs.csv --plot
+If you don't have a real serial port, run with --simulate to generate fake telemetry for testing.
+
+The Script
+#!/usr/bin/env python3
+"""
+DE5 / QMD Serial Interface — Adaptive Morphing with Multi-Criteria Weighting
+- Weights: torque, efficiency, temperature (user sliders)
+- Global aggressiveness slider (morph step size / tolerance)
+- Matplotlib GUI with sliders and live plots
+Usage:
+    python de5_serial_visualizer_weighted.py --port COM4 --baud 115200 --de5 DE5_top30_FEM_inputs.csv --plot
+    python de5_serial_visualizer_weighted.py --simulate --plot
+"""
+
+import argparse
+import threading
+import time
+import csv
+import sys
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.widgets import Slider, Button
+import serial  # pyserial
+
+# ----------------------------
+# Configuration
+# ----------------------------
+MORPH_COOLDOWN_S = 1.0      # minimum seconds between morph decisions
+MORPH_STEP_MAX = 1          # max rows to jump per decision (1 for smooth morph)
+TELEMETRY_WINDOW = 30      # number of recent telemetry points to average
+DEFAULT_BAUD = 115200
+
+# ----------------------------
+# Globals / State
+# ----------------------------
+telemetry = []             # (timestamp, current_A, vcmd, itgt, temp_C, torque_est, eff_est)
+telemetry_lock = threading.Lock()
+active_row = 1
+adaptive_on = False
+running = True
+port = None
+de5_table = None
+last_morph_time = 0
+simulate_mode = False
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def load_de5_table(path):
+    df = pd.read_csv(path)
+    if 'row_id' not in df.columns:
+        df.insert(0, 'row_id', np.arange(1, len(df)+1))
+    # Ensure required columns exist; if not, create proxies
+    if 'torque' not in df.columns:
+        df['torque'] = df.get('pred_torque_Nm', np.linspace(1, 0.1, len(df)))
+    if 'efficiency' not in df.columns:
+        df['efficiency'] = df.get('pred_efficiency', np.linspace(0.8, 0.95, len(df)))
+    if 'est_temp' not in df.columns:
+        # create a proxy: higher torque and lower efficiency raise temperature
+        df['est_temp'] = 40 + (df['torque'] / df['torque'].max())*60 + (1 - df['efficiency'])*50
+    return df
+
+def send_command(cmd):
+    """Send a command to the MCU; MCUs should accept lines like 'R{n}\\r' to set row."""
+    global port
+    if simulate_mode:
+        print(f"[SIM CMD] {cmd}")
+        return
+    try:
+        if not cmd.endswith('\r'):
+            cmd = cmd + '\r'
+        port.write(cmd.encode('ascii', errors='ignore'))
+    except Exception as e:
+        print("[SERIAL SEND ERROR]", e)
+
+# ----------------------------
+# Serial reader (or simulator)
+# ----------------------------
+def serial_reader_thread(serial_port, baud):
+    global running, telemetry, simulate_mode
+    if simulate_mode:
+        # simulate telemetry: produce current, vcmd, itgt, temp, torque_est, eff_est
+        t0 = time.time()
+        while running:
+            ts = time.time()
+            # simple oscillating telemetry for testing
+            current = 50 + 30*np.sin((ts - t0)*0.5)
+            vcmd = 0.5*np.cos((ts - t0)*0.3)
+            itgt = 50.0
+            temp = 40 + 10*np.sin((ts - t0)*0.2) + 0.1*(current-50)
+            torque_est = 100 + 50*np.sin((ts - t0)*0.4)
+            eff_est = 0.90 + 0.02*np.cos((ts - t0)*0.35)
+            with telemetry_lock:
+                telemetry.append((ts, current, vcmd, itgt, temp, torque_est, eff_est))
+                if len(telemetry) > 500:
+                    telemetry = telemetry[-500:]
+            time.sleep(0.1)
+        return
+
+    try:
+        ser = serial.Serial(serial_port, baud, timeout=0.5)
+        print(f"[SERIAL] Opened {serial_port} @ {baud}")
+    except Exception as e:
+        print("[SERIAL OPEN ERROR]", e)
+        return
+
+    while running:
+        try:
+            line = ser.readline().decode('ascii', errors='ignore').strip()
+            if not line:
+                continue
+            # Expect telemetry CSV-like line: time, current, vcmd, itgt, temp, torque, eff
+            parts = line.split(',')
+            if len(parts) >= 7:
+                try:
+                    ts = float(parts[0])
+                    current = float(parts[1])
+                    vcmd = float(parts[2])
+                    itgt = float(parts[3])
+                    temp = float(parts[4])
+                    torque = float(parts[5])
+                    eff = float(parts[6])
+                    with telemetry_lock:
+                        telemetry.append((ts, current, vcmd, itgt, temp, torque, eff))
+                        if len(telemetry) > 500:
+                            telemetry = telemetry[-500:]
+                except Exception:
+                    # non-number line or log; print for debug
+                    print("[SERIAL LINE]", line)
+            else:
+                # possible control status like ROW=5
+                if line.startswith("ROW="):
+                    try:
+                        r = int(line.split("=")[1])
+                        set_active_row_local(r)
+                    except:
+                        pass
+        except Exception as e:
+            print("[SERIAL READ ERROR]", e)
+            break
+    ser.close()
+
+# ----------------------------
+# DE5 morph decision logic
+# ----------------------------
+def normalize_array(arr):
+    a = np.array(arr, dtype=float)
+    mn, mx = np.nanmin(a), np.nanmax(a)
+    if mx - mn < 1e-9:
+        return np.ones_like(a) * 0.5
+    return (a - mn) / (mx - mn)
+
+def compute_best_row(w_torque, w_eff, w_temp, aggressiveness=1.0):
+    """
+    Using the de5_table, compute normalized scores and return best row index (row_id).
+    aggressiveness scales how far we are willing to step (higher -> larger allowed step)
+    """
+    global de5_table
+    torque = de5_table['torque'].values
+    eff = de5_table['efficiency'].values
+    temp = de5_table['est_temp'].values
+
+    # normalize: torque & eff higher is better; temp lower is better -> invert
+    n_torque = normalize_array(torque)
+    n_eff = normalize_array(eff)
+    n_temp = 1.0 - normalize_array(temp)
+
+    # Weighted sum
+    scores = w_torque * n_torque + w_eff * n_eff + w_temp * n_temp
+    # optionally scale with aggressiveness (not required but keep for future)
+    idx = int(np.argmax(scores))  # index into de5_table
+    best_row_id = int(de5_table.iloc[idx]['row_id'])
+    return best_row_id, scores
+
+def set_active_row_local(r):
+    global active_row
+    active_row = int(max(1, min(int(r), int(de5_table['row_id'].max()))))
+    print(f"[LOCAL] active_row -> {active_row}")
+
+def morph_toward_row(target_row, max_step=MORPH_STEP_MAX):
+    """Issue MCU command to change active row by at most max_step toward target_row."""
+    global active_row, last_morph_time
+    now = time.time()
+    if now - last_morph_time < MORPH_COOLDOWN_S:
+        return False
+    if target_row == active_row:
+        return False
+    step = np.sign(target_row - active_row) * min(abs(target_row - active_row), max_step)
+    new_row = int(active_row + step)
+    new_row = max(1, min(new_row, int(de5_table['row_id'].max())))
+    # send command
+    send_command(f"R{new_row}")   # MCU should accept R<n>
+    set_active_row_local(new_row)
+    last_morph_time = now
+    print(f"[MORPH] {active_row - step} -> {new_row} (target {target_row})")
+    return True
+
+# ----------------------------
+# GUI / Plot
+# ----------------------------
+def start_gui(args):
+    global active_row, adaptive_on, de5_table
+
+    # load DE5 table
+    de5_table = load_de5_table(args.de5)
+
+    # default weights
+    w_torque = 0.4
+    w_eff = 0.4
+    w_temp = 0.2
+    aggressiveness = 1.0
+
+    # Matplotlib figure
+    plt.style.use('seaborn-darkgrid')
+    fig = plt.figure(figsize=(11, 8))
+    ax_top = plt.subplot2grid((3, 3), (0, 0), colspan=3, rowspan=2)
+    ax_map = plt.subplot2grid((3, 3), (2, 0), colspan=2)
+    ax_controls = plt.subplot2grid((3, 3), (2, 2))
+
+    # time-series placeholders
+    times = []
+    currents = []
+    temps = []
+    torques = []
+    effs = []
+
+    # torque-eff map
+    ax_map.plot(de5_table['torque'], de5_table['efficiency'], '.', alpha=0.4)
+    selected_dot, = ax_map.plot([], [], 'ro', ms=10)
+    ax_map.set_xlabel('Torque (Nm)')
+    ax_map.set_ylabel('Efficiency')
+
+    ax_top.set_title('DE5 Telemetry (Current, Temp)')
+    line_cur, = ax_top.plot([], [], label='Current A')
+    line_temp, = ax_top.plot([], [], label='Temp °C')
+    ax_top.legend(loc='upper right')
+
+    # Controls: sliders for weights and aggressiveness + toggle button
+    plt.subplots_adjust(left=0.05, right=0.98, top=0.95, bottom=0.12)
+    ax_wt = plt.axes([0.12, 0.03, 0.22, 0.03])
+    ax_we = plt.axes([0.42, 0.03, 0.22, 0.03])
+    ax_wp = plt.axes([0.72, 0.03, 0.22, 0.03])
+    ax_ag = plt.axes([0.12, 0.07, 0.8, 0.03])
+    s_wt = Slider(ax_wt, 'W_torque', 0.0, 1.0, valinit=w_torque)
+    s_we = Slider(ax_we, 'W_eff', 0.0, 1.0, valinit=w_eff)
+    s_wp = Slider(ax_wp, 'W_temp', 0.0, 1.0, valinit=w_temp)
+    s_ag = Slider(ax_ag, 'Aggressiveness', 0.1, 3.0, valinit=aggressiveness)
+    ax_button = plt.axes([0.85, 0.86, 0.12, 0.06])
+    btn = Button(ax_button, 'Adaptive: OFF', color='lightgray', hovercolor='0.975')
+
+    def toggle_adaptive(event):
+        nonlocal adaptive_on
+        adaptive_on = not adaptive_on
+        btn.label.set_text(f"Adaptive: {'ON' if adaptive_on else 'OFF'}")
+        btn.color = 'lightgreen' if adaptive_on else 'lightgray'
+    btn.on_clicked(toggle_adaptive)
+
+    # function to pick best row by weights
+    def weighted_decision_step():
+        nonlocal w_torque, w_eff, w_temp, aggressiveness
+        w_torque = s_wt.val
+        w_eff = s_we.val
+        w_temp = s_wp.val
+        aggressiveness = s_ag.val
+        # normalize weights so they sum to 1, but allow user to set arbitrary
+        s = max(1e-9, w_torque + w_eff + w_temp)
+        w_torque /= s; w_eff /= s; w_temp /= s
+
+        best_row, scores = compute_best_row(w_torque, w_eff, w_temp, aggressiveness)
+        return best_row, scores
+
+    # animation update
+    def update(frame):
+        nonlocal times, currents, temps, torques, effs, active_row
+
+        # pull latest telemetry snapshot
+        with telemetry_lock:
+            data = telemetry[-TELEMETRY_WINDOW:]
+        if not data:
+            return line_cur, line_temp, selected_dot
+
+        t0 = data[0][0]
+        times = [d[0] - t0 for d in data]
+        currents = [d[1] for d in data]
+        temps = [d[4] for d in data]
+        torques = [d[5] for d in data]
+        effs = [d[6] for d in data]
+
+        line_cur.set_data(times, currents)
+        line_temp.set_data(times, temps)
+        ax_top.relim(); ax_top.autoscale_view()
+
+        # update map dot for active_row
+        if 1 <= active_row <= len(de5_table):
+            r = de5_table.loc[de5_table['row_id'] == active_row].iloc[0]
+            selected_dot.set_data([r['torque']], [r['efficiency']])
+
+        # adaptive decision
+        if adaptive_on:
+            best_row, scores = weighted_decision_step()
+            # apply some hysteresis/threshold via aggressiveness
+            # If best_row differs, morph toward it (one step)
+            morph_toward_row(best_row, max_step=int(np.clip(MORPH_STEP_MAX * s_ag.val, 1, 5)))
+
+        return line_cur, line_temp, selected_dot
+
+    ani = animation.FuncAnimation(fig, update, interval=300)
+
+    plt.show()
+
+# ----------------------------
+# CLI / Entry point
+# ----------------------------
+def main():
+    global running, port, simulate_mode
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', help='Serial port (e.g., COM4 or /dev/ttyUSB0)')
+    parser.add_argument('--baud', type=int, default=DEFAULT_BAUD)
+    parser.add_argument('--de5', default='DE5_top30_FEM_inputs.csv', help='DE5 CSV table')
+    parser.add_argument('--simulate', action='store_true', help='Run simulated telemetry (no serial)')
+    parser.add_argument('--plot', action='store_true', help='Open GUI (default behavior)')
+    args = parser.parse_args()
+
+    if args.simulate:
+        simulate_mode = True
+        t = threading.Thread(target=serial_reader_thread, args=(None, None), daemon=True)
+        t.start()
+    elif args.port:
+        # start serial reader thread
+        try:
+            t = threading.Thread(target=serial_reader_thread, args=(args.port, args.baud), daemon=True)
+            t.start()
+        except Exception as e:
+            print("[ERROR starting serial reader]", e)
+            return
+    else:
+        print("Either --port or --simulate must be provided. Use --help for details.")
+        return
+
+    try:
+        start_gui(args)
+    except KeyboardInterrupt:
+        print("[INTERRUPT] Exiting...")
+    finally:
+        running = False
+        time.sleep(0.5)
+
+if __name__ == '__main__':
+    main()
+
+Notes & Integration Tips
+    • MCU protocol: The script sends R<n> to select row <n>; the MCU firmware must interpret that and switch the active DE5 parameter row. Keep line endings as \r or \n as you prefer but be consistent.
+    • Telemetry format: By default, the simulator emits tuples (ts, current, vcmd, itgt, temp, torque, eff) and the serial reader expects CSV lines matching that. If your MCU streams a different format, adapt the parsing block.
+    • Weight tuning: Start with torque/eff = 0.4 each, temp = 0.2. Use sliders at runtime to find desirable behavior, then lock values for repeated tests.
+    • Aggressiveness: The slider controls how rapidly the GUI is allowed to step through rows; keep it low for stable tests.
+    • Safety: The script rate-limits morphing (MORPH_COOLDOWN_S) to avoid rapid switching; increase cooldown if the MCU needs more settling time.
+    • Extending the score: Replace the linear weighted sum with any scoring function (e.g., multiplicative or penalized objective). You can also include other telemetry channels (vibration, current ripple) in the score.
