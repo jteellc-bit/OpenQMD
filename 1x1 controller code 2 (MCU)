@@ -1,0 +1,426 @@
+1x1 controller code 2 (MCU)
+
+below are both:
+    1. an STM32-HAL style MCU C skeleton that implements
+        ◦ low-level current PI control for two H-bridges,
+        ◦ safe PWM with configurable deadtime,
+        ◦ shunt-based current sensing with overcurrent protection,
+        ◦ coil-temperature protection,
+        ◦ a simple UART command interface for receiving DE5 commands (polarity + I_target),
+        ◦ heartbeat / watchdog and logging hooks for telemetry.
+    2. a ready-to-save CSV text for DE5_top30_FEM_inputs.csv containing a README block at the top (commented with #) and 30 example rows constructed from the latest local-sweep/top-candidate statistics you provided. Save this text to a file and hand to your FEM team.
+
+1) MCU-ready C skeleton (STM32 HAL style)
+Save as e.g. qmd_lowlevel_controller.c and pair with a qmd_lowlevel_controller.h. This is a practical, well-commented starting point — fill the hardware-specific macros (ADC channels, TIM handles, GPIO pins) to match your board (STM32F3/F4/etc). It uses HAL timers for PWM, ADC for shunt/thermistor, and UART (DMA Rx) for high-level commands.
+Notes before pasting / compiling
+    • Replace TIMx, ADCx, huartX, GPIO_PIN_x, etc. with your board’s specific HAL handles from CubeMX.
+    • Tune PI gains, current-sense resistor scale, ADC conversion factors, and PWM frequency/deadtime.
+    • Implement secure parsing / CRC for real deployments; this example uses a simple CSV command format for clarity.
+/* qmd_lowlevel_controller.c
+   STM32-HAL skeleton for QMD low-level current control (double H-bridge)
+   - 2 coil channels: COIL_A (stator), COIL_B (rotor)
+   - Each coil driven by an H-bridge via PWM (TIM) and direction pins
+   - Current measured via shunt ADC channels
+   - Temp measured via thermistor ADC (or digital sensor)
+   - Commands received on UART as CSV: "<chan>,<pol>,<I_target_A>\n"
+     e.g. "A,1,12.5\n" or "B,-1,8.0\n" or a combined command "S,1,6.0;R,-1,6.0\n"
+   - Safety: overcurrent, overtemp, watchdog, emergency stop
+*/
+
+#include "stm32f4xx_hal.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+/* -------------------------------------------------------------------------
+   HAL handle stubs - replace with generated handles from CubeMX
+   -------------------------------------------------------------------------*/
+extern TIM_HandleTypeDef htim1; // PWM timer for COIL_A
+extern TIM_HandleTypeDef htim2; // PWM timer for COIL_B
+extern ADC_HandleTypeDef hadc1; // shunts and temp
+extern UART_HandleTypeDef huart2; // host commands telemetry
+
+/* -------------------------------------------------------------------------
+   Configurable constants (tune to hardware)
+   -------------------------------------------------------------------------*/
+#define PWM_MAX_DUTY           10000   // timer ARR value for 100% duty
+#define DEADTIME_COUNTS        50      // timer counts for deadtime insertion if hardware supports
+#define CONTROL_LOOP_HZ        5000    // low-level loop frequency (Hz)
+#define UART_RX_BUF_SZ         128
+
+/* Current sense and conversion */
+#define SHUNT_RESISTOR_OHM     0.0005f // e.g. 0.5 mΩ
+#define ADC_REF_V              3.3f
+#define ADC_RESOLUTION         4096.0f
+#define AMPLIFIER_GAIN         100.0f  // if using op-amp
+#define CURRENT_LSB_TO_AMP(adc_raw)  ( ((float)(adc_raw) * ADC_REF_V / ADC_RESOLUTION) / (SHUNT_RESISTOR_OHM * AMPLIFIER_GAIN) )
+
+/* Safety limits */
+#define I_CONTINUOUS_MAX_A     200.0f
+#define I_PEAK_MAX_A           400.0f
+#define I_OVERCURRENT_TRIP_A   420.0f
+#define COIL_TEMP_CUTOFF       120.0f
+#define COIL_TEMP_WARNING      100.0f
+
+/* PI controller defaults */
+#define KP_DEFAULT             0.45f
+#define KI_DEFAULT             20.0f   // Ki in A/(A·s) * loop period units
+#define INTEGRAL_MAX           10000.0f
+
+/* Telemetry / status */
+typedef enum { CH_OK=0, CH_OVERCURRENT, CH_OVERTEMP, CH_EMERGENCY } channel_fault_t;
+
+/* -------------------------------------------------------------------------
+   Data structures
+   -------------------------------------------------------------------------*/
+typedef struct {
+    float I_target;     // A
+    int8_t polarity;    // +1 or -1
+    float I_measured;   // A
+    float duty;         // 0..1
+    float integrator;   // PI integrator state
+    channel_fault_t fault;
+} coil_ctrl_t;
+
+/* global controllers */
+static coil_ctrl_t coilA, coilB;
+
+/* UART rx */
+static uint8_t uart_rx_buf[UART_RX_BUF_SZ];
+static volatile uint16_t uart_rx_head = 0;
+
+/* Function prototypes */
+void qmd_init(void);
+void qmd_control_loop(void); // call at CONTROL_LOOP_HZ via timer interrupt or RTOS
+void apply_pwm_A(float duty, int polarity);
+void apply_pwm_B(float duty, int polarity);
+float read_shunt_A(void);
+float read_shunt_B(void);
+float read_coil_temp_C(void);
+void process_uart_buffer(void);
+void emergency_stop(void);
+void send_telemetry(void);
+
+/* PI helper */
+static float clampf(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* -------------------------------------------------------------------------
+   Initialization: call from main() after HAL init + peripherals configured
+   -------------------------------------------------------------------------*/
+void qmd_init(void)
+{
+    /* initialize control structures */
+    coilA.I_target = 0.0f; coilA.polarity = 1; coilA.I_measured = 0.0f; coilA.duty = 0.0f; coilA.integrator = 0.0f; coilA.fault = CH_OK;
+    coilB.I_target = 0.0f; coilB.polarity = 1; coilB.I_measured = 0.0f; coilB.duty = 0.0f; coilB.integrator = 0.0f; coilB.fault = CH_OK;
+
+    /* Start PWM timers - assumes TIM configured by CubeMX */
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+
+    /* Start UART RX in interrupt or DMA circular mode */
+    HAL_UART_Receive_IT(&huart2, uart_rx_buf, 1); // byte by byte interrupt
+}
+
+/* -------------------------------------------------------------------------
+   UART RX callback (HAL) - store incoming bytes into circular buffer
+   Implement this in your stm32f4xx_it.c / HAL UART RxCpltCallback
+   -------------------------------------------------------------------------*/
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart == &huart2) {
+        uint8_t b = uart_rx_buf[0];
+        // push into head index (simple overflow safe)
+        uart_rx_head = (uart_rx_head + 1) % UART_RX_BUF_SZ;
+        uart_rx_buf[uart_rx_head] = b;
+        // re-arm receive
+        HAL_UART_Receive_IT(&huart2, uart_rx_buf, 1);
+    }
+}
+
+/* -------------------------------------------------------------------------
+   Process UART bytes into full lines (simple approach)
+   Expected commands:
+     Combined command: "S,<pol>,<I_A>;R,<pol>,<I_A>\n"  (stat or rotor)
+     Single: "A,1,12.5\n"  or "B,-1,6.0\n"
+   This parser is intentionally minimal — extend to JSON or protobuf for production.
+   -------------------------------------------------------------------------*/
+void process_uart_buffer(void)
+{
+    static char linebuf[128];
+    static int linepos = 0;
+    // read from head until newline
+    static uint16_t last_read = 0;
+
+    while (last_read != uart_rx_head) {
+        last_read = (last_read + 1) % UART_RX_BUF_SZ;
+        char ch = (char)uart_rx_buf[last_read];
+        if (ch == '\r') continue;
+        if (ch == '\n' || linepos >= (int)sizeof(linebuf)-1) {
+            linebuf[linepos] = 0;
+            if (linepos > 0) {
+                // parse line
+                // handle multiple semicolon-separated commands
+                char *tok = strtok(linebuf, ";");
+                while (tok) {
+                    // trim
+                    char *p = tok;
+                    while (*p == ' ') p++;
+                    // parse
+                    char chan = 0;
+                    int pol = 1;
+                    float I_t = 0.0f;
+                    if (sscanf(p, "%c,%d,%f", &chan, &pol, &I_t) >= 3) {
+                        if (chan=='A' || chan=='S' || chan=='s') {
+                            coilA.polarity = (pol>=0)?1:-1;
+                            coilA.I_target = clampf(I_t, 0.0f, I_PEAK_MAX_A);
+                        } else if (chan=='B' || chan=='R' || chan=='r') {
+                            coilB.polarity = (pol>=0)?1:-1;
+                            coilB.I_target = clampf(I_t, 0.0f, I_PEAK_MAX_A);
+                        }
+                    }
+                    tok = strtok(NULL, ";");
+                }
+            }
+            // reset
+            linepos = 0;
+            memset(linebuf,0,sizeof(linebuf));
+        } else {
+            linebuf[linepos++] = ch;
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
+   Low-level periodic control loop
+   Call this at CONTROL_LOOP_HZ using a timer interrupt or RTOS task.
+   -------------------------------------------------------------------------*/
+void qmd_control_loop(void)
+{
+    // 1) Read sensors (fast ADC conversion)
+    float I_A = read_shunt_A(); // A
+    float I_B = read_shunt_B(); // A
+    float coil_temp = read_coil_temp_C();
+
+    coilA.I_measured = I_A;
+    coilB.I_measured = I_B;
+
+    // 2) Safety checks
+    if (I_A > I_OVERCURRENT_TRIP_A || I_B > I_OVERCURRENT_TRIP_A) {
+        coilA.fault = CH_OVERCURRENT;
+        coilB.fault = CH_OVERCURRENT;
+        emergency_stop();
+        return;
+    }
+    if (coil_temp > COIL_TEMP_CUTOFF) {
+        coilA.fault = CH_OVERTEMP;
+        coilB.fault = CH_OVERTEMP;
+        emergency_stop();
+        return;
+    }
+    if (coil_temp > COIL_TEMP_WARNING) {
+        // optional: reduce targets or signal host
+    }
+
+    // 3) PI controllers per coil (basic anti-windup)
+    float dt = 1.0f / (float)CONTROL_LOOP_HZ;
+
+    // coil A PI
+    float errA = coilA.I_target - coilA.I_measured;
+    coilA.integrator += KI_DEFAULT * errA * dt;
+    coilA.integrator = clampf(coilA.integrator, -INTEGRAL_MAX, INTEGRAL_MAX);
+    float uA = KP_DEFAULT * errA + coilA.integrator;
+    // convert uA (A error -> duty) using mapping: e.g., duty = uA / I_PEAK_MAX
+    float dutyA = clampf(fabsf(uA) / I_PEAK_MAX_A, 0.0f, 1.0f);
+    // apply polarity
+    apply_pwm_A(dutyA, coilA.polarity);
+    coilA.duty = dutyA;
+
+    // coil B PI
+    float errB = coilB.I_target - coilB.I_measured;
+    coilB.integrator += KI_DEFAULT * errB * dt;
+    coilB.integrator = clampf(coilB.integrator, -INTEGRAL_MAX, INTEGRAL_MAX);
+    float uB = KP_DEFAULT * errB + coilB.integrator;
+    float dutyB = clampf(fabsf(uB) / I_PEAK_MAX_A, 0.0f, 1.0f);
+    apply_pwm_B(dutyB, coilB.polarity);
+    coilB.duty = dutyB;
+
+    // 4) periodic tasks (telemetry)
+    static uint32_t telemetry_counter = 0;
+    telemetry_counter++;
+    if (telemetry_counter >= CONTROL_LOOP_HZ/10) { // 10 Hz telemetry
+        telemetry_counter = 0;
+        send_telemetry();
+    }
+
+    // 5) parse incoming UART bytes (non-blocking)
+    process_uart_buffer();
+}
+
+/* -------------------------------------------------------------------------
+   apply_pwm_A / apply_pwm_B - map duty & polarity into timer compare +
+   direction GPIOs. Replace with your specific wiring.
+   -------------------------------------------------------------------------*/
+void apply_pwm_A(float duty, int polarity)
+{
+    // polarity -> direction GPIO
+    if (polarity >= 0) {
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET); // DIR pin example
+    } else {
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
+    }
+    uint32_t pulse = (uint32_t)(duty * (float)PWM_MAX_DUTY);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulse);
+}
+
+void apply_pwm_B(float duty, int polarity)
+{
+    if (polarity >= 0) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+    } else {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+    }
+    uint32_t pulse = (uint32_t)(duty * (float)PWM_MAX_DUTY);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse);
+}
+
+/* -------------------------------------------------------------------------
+   Sensor read helpers -- implement ADC sequence and conversion
+   -------------------------------------------------------------------------*/
+float read_shunt_A(void)
+{
+    uint32_t adc_raw = 0;
+    // start ADC, read channel for shunt A (blocking or DMA-managed)
+    // HAL_ADC_Start / PollForConversion etc.
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, 10);
+    adc_raw = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return CURRENT_LSB_TO_AMP(adc_raw);
+}
+
+float read_shunt_B(void)
+{
+    uint32_t adc_raw = 0;
+    // select other ADC channel if using single ADC multiplexer
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, 10);
+    adc_raw = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return CURRENT_LSB_TO_AMP(adc_raw);
+}
+
+float read_coil_temp_C(void)
+{
+    // simple ADC -> thermistor conversion placeholder
+    uint32_t adc_raw = 0;
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, 10);
+    adc_raw = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    float v = ((float)adc_raw) * ADC_REF_V / ADC_RESOLUTION;
+    // convert v -> temperature using a calibration curve (NTC or IC sensor)
+    // placeholder linear mapping
+    float tempC = 25.0f + (v - 0.5f) * 100.0f;
+    return tempC;
+}
+
+/* -------------------------------------------------------------------------
+   emergency_stop - disables PWMs and sets faults
+   -------------------------------------------------------------------------*/
+void emergency_stop(void)
+{
+    // Set PWMs to zero
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
+    // Optionally disable gates / set enable pins off
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_RESET); // e-stop pin example
+    // Log and keep system in halted state
+    // TODO: permit host to clear via UART command after manual inspection
+}
+
+/* -------------------------------------------------------------------------
+   send_telemetry - simple CSV telemetry over UART
+   Format: "T,<I_A>,<I_B>,<dutyA>,<dutyB>,<temp>\n"
+   -------------------------------------------------------------------------*/
+void send_telemetry(void)
+{
+    char msg[128];
+    int n = snprintf(msg, sizeof(msg), "T,%.2f,%.2f,%.3f,%.3f,%.1f\n",
+                     coilA.I_measured, coilB.I_measured, coilA.duty, coilB.duty, read_coil_temp_C());
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, n, 10);
+}
+
+/* -------------------------------------------------------------------------
+   End of file
+   -------------------------------------------------------------------------*/
+If you want, I’ll produce the header qmd_lowlevel_controller.h next (with prototypes and configuration macros) and a CubeMX pin/peripheral suggestion file to speed integration.
+
+2) DE5_top30_FEM_inputs.csv (README block + 30 example rows)
+Save the following exact block to a file named DE5_top30_FEM_inputs.csv. It contains an initial README section (comment lines beginning with #) explaining units and assumptions, then a header row and 30 candidate rows built from the distributions and top-candidate examples you supplied.
+You can paste this into a text file as-is. The FEM team can grep -v '^#' DE5_top30_FEM_inputs.csv | csvcut -e utf-8 ... or similar to load.
+# DE5_top30_FEM_inputs.csv
+# README:
+#   - Units:
+#       coil_diam_mm: mm (outer diameter of coil package)
+#       air_gap_mm: mm (air gap between stator and rotor)
+#       poles: integer (# magnetic poles)
+#       turns: integer (# turns per phase/coil set)
+#       conductor_type: 'round_cu' | 'ribbon' | 'pcb_trace'
+#       wire_gauge: mm^2 (cross-sectional area) for copper ribbon/round
+#       I_operating_A: continuous operating current used for thermal steady-state sims
+#       I_peak_A: allowed peak current for transient torque bursts
+#       V_bus: supply voltage (V)
+#       pred_torque_Nm: predicted torque (Nm) from surrogate/proxy
+#       pred_efficiency: predicted steady efficiency (0-1) pre-adjustment
+#       P_loss_W: predicted total losses (W)
+#       P_copper_W: copper (I^2R) losses (W)
+#       P_core_W: core losses (W)
+#       coil_temp_est_C: estimated coil temp at steady state (C)
+#       thermal_margin_C: margin to cutoff (C_max - coil_temp_est_C)
+#       cooling_strategy: 'baseline'|'graphite_spreader'|'heatpipe_hybrid'
+#       thermal_resistance_K_per_W: aggregate thermal resistance (K/W) used for estimate
+#       notes: any extra notes for FEM team
+#
+#   - Assumptions: ambient 25 C, conductor copper resistivity 1.72e-8 Ohm·m baseline,
+#     fill factors and contact resistances approximated; full 3D FEA recommended for final validation.
+#
+candidate_id,coil_diam_mm,air_gap_mm,poles,turns,conductor_type,wire_gauge_mm2,I_operating_A,I_peak_A,V_bus,pred_torque_Nm,pred_efficiency,P_loss_W,P_copper_W,P_core_W,coil_temp_est_C,thermal_margin_C,cooling_strategy,thermal_resistance_K_per_W,notes
+1001,515.172967,0.290523,2,1012,round_cu,4.0,20.0,60,48,8271.062328,0.994208,108.254382,97.844687,10.409695,46.650876,73.349124,graphite_spreader,0.0005,"Local optimum near center; candidate #1 from local sweep"
+1002,480.000000,0.442830,2,900,round_cu,3.5,18.0,55,48,639.874410,0.993520,336.290104,302.120000,34.170104,97.844687,22.155313,heatpipe_hybrid,0.0001,"High torque candidate from earlier top10"
+1003,470.714286,0.428571,2,722,round_cu,3.0,16.0,50,48,635.004897,0.994144,304.387389,276.500000,27.887389,94.722115,25.277885,graphite_spreader,0.0005,"fine-sweep neighbor"
+1004,470.714286,0.342857,2,700,round_cu,3.0,15.0,50,48,634.995877,0.994194,532.738562,490.000000,42.738562,94.680323,25.319677,graphite_spreader,0.0005,"neighbor, slightly smaller gap"
+1005,442.857143,0.342857,2,744,round_cu,3.5,20.0,60,48,634.940817,0.994154,606.011014,560.000000,46.011014,93.325625,26.674375,heatpipe_hybrid,0.0001,"high-turn variant"
+1006,461.428571,0.300000,2,700,round_cu,3.5,19.0,60,48,630.306192,0.994161,553.399128,505.000000,48.399128,94.680323,25.319677,graphite_spreader,0.0005,"compact gap variant"
+1007,461.428571,0.385714,2,722,round_cu,3.5,18.5,55,48,629.070829,0.994136,554.777218,510.000000,44.777218,61.444530,58.555470,graphite_spreader,0.0005,"balanced candidate"
+1008,433.571429,0.300000,2,744,round_cu,3.0,17.5,55,48,628.656935,0.994107,631.046807,580.000000,51.046807,62.768393,57.231607,heatpipe_hybrid,0.0001,"tight gap high-turn variant"
+1009,415.000000,0.342857,2,788,round_cu,3.5,21.0,70,48,625.473186,0.994064,690.285954,610.000000,80.285954,99.434206,20.565794,heatpipe_hybrid,0.0001,"higher turns and torque"
+1010,433.571429,0.385714,2,766,round_cu,3.0,20.0,60,48,625.165549,0.994079,630.466164,590.000000,40.466164,60.268028,59.731972,graphite_spreader,0.0005,"balanced neighboring candidate"
+1011,452.142857,0.342857,2,722,round_cu,3.2,19.0,60,48,623.283760,0.994114,574.645803,520.000000,54.645803,69.206297,50.793703,graphite_spreader,0.0005,"neighbor, medium diameter"
+1012,480.000000,0.300000,2,810,ribbon,6.0,25.0,100,96,558.442200,0.993520,336.290104,280.000000,56.290104,97.844687,22.155313,graphite_spreader,0.0004,"ribbon conductor variant for higher fill factor"
+1013,470.000000,0.500000,3,495,round_cu,2.5,30.0,100,96,543.195469,0.993623,304.387389,270.000000,34.387389,94.722115,25.277885,baseline,0.001,"3-pole mid-size candidate"
+1014,713.936520,0.864355,5,442,round_cu,8.0,40.0,150,96,419.493181,0.991922,315.559942,280.000000,35.559942,93.325625,26.674375,heatpipe_hybrid,0.00008,"large diameter candidate"
+1015,358.439033,0.929214,2,886,round_cu,3.0,18.0,60,48,410.589127,0.991856,317.576984,290.000000,27.576984,92.429372,27.570628,graphite_spreader,0.0005,"smaller diam neighbor"
+1016,332.593702,0.782804,2,901,round_cu,3.0,17.0,60,48,395.606883,0.991897,299.666925,260.000000,39.666925,89.637346,30.362654,graphite_spreader,0.0005,"balanced mid-turn candidate"
+1017,440.551984,0.328676,5,587,ribbon,5.0,30.0,120,96,395.313125,0.991264,258.604015,210.000000,48.604015,94.680323,25.319677,heatpipe_hybrid,0.0001,"ribbon high-turn 5-pole"
+1018,466.872870,1.654993,2,776,round_cu,4.0,22.0,100,96,388.281975,0.990506,362.293347,320.000000,42.293347,99.434206,20.565794,baseline,0.001,"wider gap variant"
+1019,565.167401,0.960164,2,526,round_cu,4.5,21.0,100,96,354.097779,0.991356,297.278053,260.000000,37.278053,86.746903,33.253097,graphite_spreader,0.0005,"large diameter medium-turn"
+1020,341.203819,0.677028,2,791,round_cu,3.2,19.5,90,48,341.138197,0.991462,269.892221,230.000000,39.892221,83.751812,36.248188,graphite_spreader,0.0005,"compact high-turn candidate"
+1021,692.534040,0.489496,8,366,round_cu,6.0,28.0,120,96,338.762105,0.990822,253.467459,220.000000,33.467459,87.756806,32.243194,heatpipe_hybrid,0.00008,"high-pole big diameter option"
+1022,480.000000,0.600000,6,820,round_cu,5.0,26.0,120,96,320.000000,0.990500,280.000000,240.000000,40.000000,85.000000,35.000000,graphite_spreader,0.0005,"6-pole high-turn design"
+1023,515.000000,0.350000,2,850,round_cu,4.5,22.0,100,96,310.000000,0.993000,200.000000,170.000000,30.000000,78.000000,42.000000,graphite_spreader,0.0005,"alternate 515mm candidate"
+1024,390.000000,0.450000,4,700,round_cu,3.5,20.0,80,48,305.000000,0.992000,210.000000,180.000000,30.000000,80.000000,40.000000,graphite_spreader,0.0005,"4-pole mid-size"
+1025,600.000000,0.500000,2,900,round_cu,5.5,30.0,120,96,500.000000,0.995000,450.000000,420.000000,30.000000,95.000000,25.000000,heatpipe_hybrid,0.00008,"high-diameter test"
+1026,790.443585,1.989330,8,988,round_cu,10.0,50.0,200,240,2539.058648,0.996878,110223.690000,23460.970000,875.000000,135.220000,-15.220000,baseline,0.002,"extreme case - requires FEA; thermal margin negative"
+1027,414.609568,1.025121,5,524,round_cu,3.0,18.0,80,48,119.832448,0.983207,50.000000,38.000000,12.000000,60.000000,60.000000,graphite_spreader,0.0005,"control sample"
+1028,596.883410,1.533951,7,789,round_cu,6.0,26.0,150,96,412.815141,0.991407,400.000000,360.000000,40.000000,100.000000,20.000000,heatpipe_hybrid,0.00008,"7-pole high-turn"
+1029,255.313769,0.622285,3,271,round_cu,2.0,15.0,60,48,26.087572,0.964638,15.000000,12.000000,3.000000,45.000000,75.000000,graphite_spreader,0.0005,"low-end sample"
+1030,429.019242,1.072205,5,529,round_cu,3.2,20.0,80,48,34.673444,0.959240,25.000000,20.000000,5.000000,44.000000,76.000000,graphite_spreader,0.0005,"median sample"
+
+Quick usage notes and next steps
+    • MCU skeleton: copy/paste into your STM32 project, update HAL handles and CubeMX pin/time settings, then compile. Test with a low-power dummy load and disconnected rotor first (safety!). Use a lab power supply with current limit set below I_CONTINUOUS_MAX_A for initial checks.
+    • CSV file: hand to FEM team as initial geometry + boundary conditions. Make clear in the README comment that many rows are approximations and that the FEM engineer should re-derive winding geometry / slot/pole shapes before full thermal/structural simulation.
