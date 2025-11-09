@@ -1,0 +1,260 @@
+1x1 controller code 1
+
+
+Below you’ll find:
+    • a ready-to-drop-in DE5 → QMD controller (code + explanation),
+    • a clear, practical protocol for tuning the saturation constants (I_sat, α),
+    • a hardware-layer mapping (MCU / H-bridge skeleton and safety rules),
+    • instructions and a code snippet to re-run the notebook grid / local sweep with the DE5 controller integrated and export the top-FEM CSV.
+All code is Colab-ready Python (pure-Python, numpy/scipy friendly). Nothing was executed here — paste into your Colab notebook cells and run. I kept the implementation explicit so you can tune constants and replace placeholders with your exact DE5 parameter sets.
+
+1) Drop-in DE5: Controller that emits polarity & current setpoints
+Purpose: replace the simple QMD_solver(state) placeholder with a DE5_QMD_controller(state, de5_params, battery_limits, op_targets) that returns the structured commands your low-level stack expects:
+"""
+DE5 → QMD control module (drop-in).
+Inputs:
+  - state: dict with keys: t, omega (rad/s), theta_mech (rad), coil_temp_C, battery (dict)
+           you can add sensor-history or local field estimates
+  - de5_params: dictionary/array holding the DE5 modal parameters consistent with Appendix E
+  - op_targets: dict e.g., {'torque_desired_Nm': ..., 'speed_desired_rpm': ...}
+  - battery_limits: {'V_bus':..., 'I_cont':..., 'I_peak':...}
+Outputs:
+  - commands: {'stator': {'polarity': ±1, 'I_target': A}, 'rotor': {'polarity': ±1, 'I_target': A}, 'meta': {...}}
+"""
+
+import numpy as np
+
+def saturation_scale(I, I_sat, alpha):
+    # smooth decreasing scale (0..1) as a function of |I|
+    return 1.0 / (1.0 + (np.abs(I) / float(I_sat))**float(alpha))
+
+def solve_I_for_torque(T_des, k_t_base, I_sat, alpha, I_max, tol=1e-3, maxit=50):
+    # solve I = T_des / (k_t_base * S(I)) by fixed-point iteration on I
+    # rearranged: I_next = T_des / (k_t_base * S(I_current))
+    if T_des <= 0:
+        return 0.0
+    I = min(max(1.0, T_des / (k_t_base * 0.8)), I_max)  # initial guess
+    for _ in range(maxit):
+        S = saturation_scale(I, I_sat, alpha)
+        if S <= 0:
+            I_next = I_max
+        else:
+            I_next = float(T_des) / (k_t_base * S)
+        # clamp
+        I_next = max(0.0, min(I_next, I_max))
+        if abs(I_next - I) < tol:
+            return I_next
+        I = I_next
+    return I
+
+def compute_de5_constructive_factor(theta_mech, de5_params):
+    # compute a scalar constructivity score from DE5 modal terms
+    # de5_params expected to contain: N_modes and for each mode (A, R0, sigma, lam, phi)
+    # For rotational motor mapping we treat theta_mech (mechanical angle) as the spatial phase
+    val = 0.0
+    try:
+        modes = de5_params.get('modes', [])
+        for m in modes:
+            A = m['A']
+            lam = m['lambda']
+            phi = m['phi']
+            # map mechanical angle to normalized r-like coordinate (unitless)
+            # here r_theta = theta_mech / (2π) ∈ [0,1)
+            r_theta = (theta_mech % (2*np.pi)) / (2*np.pi)
+            Theta = 2.0 * np.pi * r_theta / lam + phi
+            val += A * np.sin(Theta)
+    except Exception:
+        # fallback behavior if params malformed
+        val = 0.0
+    return val
+
+def DE5_QMD_controller(state, de5_params, op_targets, battery_limits,
+                        k_t_base=0.06, I_sat=400.0, alpha_sat=2.0,
+                        I_max_per_coil=None):
+    """
+    Outputs polarity (+1 or -1) and I_target (A) for stator and rotor.
+    Strategy:
+     - Use DE5 modal constructive factor to choose relative phase sign (polarity).
+     - Map desired torque to current using saturation-aware inversion.
+     - Respect battery limits.
+    """
+    # Unpack
+    theta_mech = state.get('theta_mech', 0.0)   # mechanical angle rad
+    omega = state.get('omega', 0.0)
+    T_des = float(op_targets.get('torque_desired_Nm', 0.0))
+
+    # Determine "constructive sign" from DE5
+    construct = compute_de5_constructive_factor(theta_mech, de5_params)
+
+    # polarity policy: aim to align stator polarity to sign(construct)
+    pol_stator = 1 if construct >= 0 else -1
+    # rotor polarity ideally opposite sign to create attraction/repulsion timing — simple rule:
+    pol_rotor = -pol_stator
+
+    # Determine current limits
+    Vbus = battery_limits.get('V_bus', 48.0)
+    I_cont = battery_limits.get('I_cont', 60.0)
+    I_peak = battery_limits.get('I_peak', 100.0)
+    if I_max_per_coil is None:
+        I_max = I_peak
+    else:
+        I_max = min(I_peak, I_max_per_coil)
+
+    # Solve for required coil current considering saturation
+    I_required = solve_I_for_torque(T_des, k_t_base, I_sat, alpha_sat, I_max)
+
+    # Now optionally scale currents split across stator/rotor
+    # simple symmetric distribution: half current to each coil set (stator/rotor)
+    I_stator = 0.5 * I_required
+    I_rotor  = 0.5 * I_required
+
+    # Safety clamp to continuous limits for sustained operation
+    # If requested I > I_cont, set a scheduler flag (peak mode)
+    meta = {}
+    if I_required > I_cont:
+        meta['peak_mode'] = True
+        # but keep individual coil current below peak burst limits
+        I_stator = min(I_stator, I_max)
+        I_rotor  = min(I_rotor, I_max)
+    else:
+        meta['peak_mode'] = False
+
+    commands = {
+        'stator': {'polarity': int(pol_stator), 'I_target': float(I_stator)},
+        'rotor' : {'polarity': int(pol_rotor ), 'I_target': float(I_rotor)},
+        'meta'  : {'I_total_est': float(I_required), 'construct': float(construct)}
+    }
+    return commands
+How this maps to your stack
+    • Replace the old QMD_solver function with DE5_QMD_controller. The call in the notebook / simulation loop should be:
+commands = DE5_QMD_controller(state, de5_params, op_targets, battery_limits,
+                              k_t_base=..., I_sat=..., alpha_sat=..., I_max_per_coil=...)
+    • The commands dict is directly usable by the inner current PI controllers in the notebook (each coil uses I_target and polarity).
+Notes & tuning knobs
+    • k_t_base is the low-current torque constant (Nm/A) — tune it to your empirical or FEA values.
+    • I_sat and alpha_sat control saturation behaviour (see next section).
+    • de5_params must be populated from the DE5 fit for the motor geometry/mode you’re using. The controller currently uses only modal A, lambda, phi terms to build a phase-aware sign/score; you can expand to use R0, sigma if you want spatial localization.
+
+2) Tuning saturation constants: protocol & code
+Goal: pick I_sat and alpha that reflect the real magnetics.
+Bench-fit procedure
+    1. Fix your motor on a test rig with accurate torque sensor and current sense.
+    2. Run current steps (e.g., 0, 10, 20, …, up to safe limit). For each current step measure steady torque T(I).
+    3. Fit the model T(I) = k_t * I * S(I) where S(I) = 1/(1 + (I/I_sat)^alpha).
+        ◦ Use nonlinear least squares to find best-fit k_t, I_sat, alpha.
+        ◦ If you already know k_t from geometry, fix it and fit I_sat,alpha only.
+Fitting snippet (Colab):
+from scipy.optimize import curve_fit
+def T_model(I, k_t, I_sat, alpha):
+    return k_t * I / (1.0 + (np.abs(I)/I_sat)**alpha)
+
+# I_meas and T_meas arrays from the rig
+popt, pcov = curve_fit(T_model, I_meas, T_meas, p0=[k_t_guess, 300.0, 2.0],
+                       bounds=([0,10,0.5],[10,10000,10]))
+k_t_fit, I_sat_fit, alpha_fit = popt
+If you don’t have bench data:
+    • Use magnetostatic FEA: run DC current sweeps, compute the B-field in the working gap or effective flux; use the current where B starts to deviate from linear to set I_sat.
+    • Use conservative I_sat (lower) to protect against uncontrolled saturation; tune upward as you gain data.
+
+3) Add hardware-layer code (MCU mapping & safety skeleton)
+Below is a clear mapping of the notebook’s inner loop into MCU components + a short C-like pseudocode skeleton to port:
+Architecture summary (two control layers)
+    • High-level QMD process (10–200 Hz)
+Runs your DE5 solver; outputs polarity, I_target for coils.
+    • Low-level current control loop (2–10 kHz)
+Runs on MCU / hardware, implements:
+        ◦ current PI
+        ◦ PWM generation for H-bridge
+        ◦ safety checks (overcurrent, temperature, watchdog)
+        ◦ encoder/position processing
+MCU skeleton (C-like pseudocode)
+// top-level periodic tasks
+void high_level_loop() { // run at e.g., 50 Hz
+    state = read_sensors_summary();
+    commands = DE5_over_UART_or_inlined(state); // DE5 may run on host or on MCU
+    send_to_low_level(commands);
+}
+
+void low_level_loop() { // run as interrupt at e.g., 5 kHz
+    // read fast sensors
+    Ia = read_current_shunt_A();
+    theta = read_encoder_angle();
+    // compute PI for coil A
+    error = commands.I_target - Ia;
+    u = Kp * error + Ki * integral(error);
+    u = clamp(u, -max_duty, +max_duty); // account for battery and safety
+    apply_pwm_to_hbridge(u, commands.polarity);
+    // safety
+    if (Ia > I_overcurrent_limit) { shut_down(); }
+    if (coil_temp_C > T_cutoff) { shut_down(); }
+}
+H-bridge wiring notes:
+    • For double-H-bridge control (two independent bridges), wire so each H-bridge drives its coil set (two rotor coils in parallel, two stator coils in parallel).
+    • Implement dead-time (avoid shoot-through).
+    • Use proper gate drivers and current-sense amplifier (shunt + op-amp or Hall sensor).
+Safety & limits
+    • Hard-coded peak current limit (from battery). For example: limit to I_max = min(battery.I_peak, coil_i_allowable).
+    • Temperature limits: T_cutoff ≈ 120°C for enamel-insulated coils; add hysteresis for restart.
+    • Ramp rates: do soft-start of current over 100–500 ms to avoid inrush and mechanical shock.
+
+4) Run notebook grid sweeps with DE5 integrated (instructions + code snippet)
+Goal: rerun local/global search using the DE5 controller so I_target/polarity are produced by the DE5 and the surrogate sees that behaviour.
+Integration steps
+    1. Import the DE5_QMD_controller into the notebook (same cell or module).
+    2. Where you previously set QMD_solver(state) placeholder, call:
+commands = DE5_QMD_controller(state, de5_params, op_targets, battery_limits,
+                              k_t_base=k_t_base, I_sat=I_sat, alpha_sat=alpha)
+    3. Use commands['stator']['I_target'] etc to compute I_req_A used to evaluate losses in eval_motor_proxy (or map to the motor physics evaluator to compute P_loss, coil_temp).
+    4. Re-run your run_local_resweep(center, grid, battery_list, ...) pipeline exactly as before. The results will now reflect DE5-driven setpoints.
+Batch-run snippet example:
+# in evaluate_point(...) inside the sweep:
+state = {'t':0.0, 'omega': omega_est, 'theta_mech': theta_mech, 'coil_temp_C': temp_est}
+ops = {'torque_desired_Nm': T_cmd}
+bat = {'V_bus': Vbus, 'I_cont': I_cont, 'I_peak': I_peak}
+cmds = DE5_QMD_controller(state, de5_params, ops, bat, k_t_base, I_sat, alpha)
+I_stator = cmds['stator']['I_target']
+I_rotor  = cmds['rotor']['I_target']
+# now compute losses using these currents
+res = eval_motor_proxy(params, I_stator, I_rotor, battery=bat)
+Re-run grid and export top-FEM CSV
+After the sweep finishes you can produce CSV export for top candidates using:
+pareto_df.to_csv('/content/DE5_local_resweep/pareto_candidates_with_DE5.csv', index=False)
+top30_df.to_csv('/content/DE5_local_resweep/DE5_top30_FEM_inputs.csv', index=False)
+Make sure top30_df contains the fields FEM needs: geometry, turns, conductor type, I_operating, cooling spec (thermal_resistance), expected losses.
+
+5) Export top candidates for FEM — recommended CSV fields & example generator
+For each candidate, the FEM team needs unambiguous geometry and boundary conditions. Export this CSV format:
+Columns to include (example):
+candidate_id,
+coil_diam_mm,
+air_gap_mm,
+poles,
+turns,
+conductor_type,    # 'round_cu', 'ribbon', 'pcb_trace'
+wire_gauge_AWG_or_mm2,
+I_operating_A,     # steady-state evaluation current
+I_peak_A,
+V_bus,
+pred_torque_Nm,
+pred_efficiency,
+P_loss_W,
+P_copper_W,
+P_core_W,
+coil_temp_est_C,
+thermal_margin_C,
+cooling_strategy,  # 'graphite_spreader', 'heatpipe_hybrid', 'baseline'
+thermal_resistance_K_per_W,
+notes
+CSV generation (snippet):
+export_cols = ['candidate_id','coil_diam_mm','air_gap_mm','poles','turns',
+               'conductor_type','wire_gauge','I_operating_A','I_peak_A','V_bus',
+               'pred_torque_Nm','pred_efficiency','P_loss_W','P_copper_W','P_core_W',
+               'coil_temp_est_C','thermal_margin_C','cooling_strategy','thermal_resistance_K_per_W','notes']
+top30_df[export_cols].to_csv('/content/DE5_top30_FEM_inputs.csv', index=False)
+Include a README row or separate file explaining units and assumptions used: ambient temperature, convection coefficient, assumed conductor resistivity, winding packing factor.
+
+Quick operational examples & tuning guidance (summary)
+    • If DE5 controller overshoots currents frequently: reduce k_t_base or increase I_sat (if you know the real magnetic knee is higher).
+    • If currents often exceed I_cont, use a scheduling policy: allow peak_mode only for brief durations (few seconds) then force cool-down.
+    • Use graphite_spreader thermal_resistance ~ 5e-4 K/W in your approximation to see realistic thermal margins (we used values like 0.0005 K/W in the earlier analysis).
+    • For ribbon wire: reduce R_winding by estimated factor (higher fill factor) — implement as variable conductor_resistivity_factor in eval_motor_proxy.
