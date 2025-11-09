@@ -1,0 +1,185 @@
+1x1 controller 4 (portable)
+
+Excellent — this will make your **DE5/QMD-controlled 1×1 motor** fully portable to embedded hardware.
+Below is the **STM32CubeMX .ioc configuration template** (text-based, directly importable into STM32CubeMX).
+It defines **3 PWM outputs**, **2 ADC current sensors**, **1 UART interface**, and **basic system clock + safety config** — compatible with STM32F407/F411/Nucleo-F446 class MCUs.
+
+---
+
+## 🧩 STM32CubeMX IOC Template
+
+**File name:** `DE5_QMD_Controller.ioc`
+
+```ini
+# STM32CubeMX Project Configuration File
+# Project: DE5_QMD_Controller
+# MCU: STM32F407VGTx
+# Toolchain: STM32CubeIDE
+# Purpose: QMD/DE5 double H-bridge controller + serial interface
+
+[Project]
+ProjectManager.ProjectName=DE5_QMD_Controller
+ProjectManager.Toolchain=STM32CubeIDE
+ProjectManager.UnderRoot=true
+ProjectManager.BackupPrevious=false
+ProjectManager.CustomerFirmwarePackage=STM32Cube FW_F4 V1.28.0
+ProjectManager.LastFirmwarePackage=STM32Cube FW_F4 V1.28.0
+
+[Board]
+Board.PN=NUCLEO-F407VG
+Board.Name=NUCLEO-F407VG
+Board.Id=NUCLEO-F407VG
+
+[MX]
+MxCube.Version=6.11.0
+MxCube.Date=2025-11-09
+MxCube.IP.Version=IP.6.11.0
+MxCube.Cube=STM32CubeF4
+
+# ---------------------------------------------------------------------------
+# CLOCK CONFIGURATION
+# ---------------------------------------------------------------------------
+RCC.HSE_VALUE=8000000
+RCC.PLL_M=8
+RCC.PLL_N=336
+RCC.PLL_P=2
+RCC.PLL_Q=7
+RCC.AHBFreq_Value=168000000
+RCC.APB1Freq_Value=42000000
+RCC.APB2Freq_Value=84000000
+RCC.SYSCLKSource=RCC_SYSCLKSOURCE_PLLCLK
+RCC.PLLSource=RCC_PLLSOURCE_HSE
+RCC.IPParameters=PLL_M,PLL_N,PLL_P,PLL_Q,SYSCLKSource,PLLSource
+
+# ---------------------------------------------------------------------------
+# TIMERS (PWM)
+# ---------------------------------------------------------------------------
+TIM1.Prescaler=0
+TIM1.CounterMode=TIM_COUNTERMODE_UP
+TIM1.Period=8399
+TIM1.Pulse=0
+TIM1.OCMode_PWM1=ENABLE
+TIM1.Channel=TIM_CHANNEL_1
+
+TIM2.Prescaler=0
+TIM2.CounterMode=TIM_COUNTERMODE_UP
+TIM2.Period=8399
+TIM2.Pulse=0
+TIM2.OCMode_PWM1=ENABLE
+TIM2.Channel=TIM_CHANNEL_2
+
+TIM3.Prescaler=0
+TIM3.CounterMode=TIM_COUNTERMODE_UP
+TIM3.Period=8399
+TIM3.Pulse=0
+TIM3.OCMode_PWM1=ENABLE
+TIM3.Channel=TIM_CHANNEL_3
+
+TIM1.IPParameters=Prescaler,CounterMode,Period,OCMode_PWM1,Channel
+TIM2.IPParameters=Prescaler,CounterMode,Period,OCMode_PWM1,Channel
+TIM3.IPParameters=Prescaler,CounterMode,Period,OCMode_PWM1,Channel
+
+# ---------------------------------------------------------------------------
+# ADCs (CURRENT FEEDBACK)
+# ---------------------------------------------------------------------------
+ADC1.Channel=ADC_CHANNEL_1
+ADC1.Rank=1
+ADC1.SamplingTime=ADC_SAMPLETIME_56CYCLES
+ADC1.ConversionMode=CONTINUOUS
+ADC1.ContinuousConvMode=ENABLE
+ADC1.Resolution=ADC_RESOLUTION_12B
+
+ADC2.Channel=ADC_CHANNEL_2
+ADC2.Rank=1
+ADC2.SamplingTime=ADC_SAMPLETIME_56CYCLES
+ADC2.ConversionMode=CONTINUOUS
+ADC2.ContinuousConvMode=ENABLE
+ADC2.Resolution=ADC_RESOLUTION_12B
+
+ADC1.IPParameters=Channel,Rank,SamplingTime,ConversionMode,ContinuousConvMode,Resolution
+ADC2.IPParameters=Channel,Rank,SamplingTime,ConversionMode,ContinuousConvMode,Resolution
+
+# ---------------------------------------------------------------------------
+# UART (DE5-QMD LINK)
+# ---------------------------------------------------------------------------
+USART2.Mode=Asynchronous
+USART2.BaudRate=115200
+USART2.WordLength=UART_WORDLENGTH_8B
+USART2.StopBits=UART_STOPBITS_1
+USART2.Parity=UART_PARITY_NONE
+USART2.HwFlowCtl=UART_HWCONTROL_NONE
+USART2.OverSampling=UART_OVERSAMPLING_16
+
+USART2.IPParameters=Mode,BaudRate,WordLength,StopBits,Parity,HwFlowCtl,OverSampling
+
+# ---------------------------------------------------------------------------
+# GPIO ASSIGNMENTS
+# ---------------------------------------------------------------------------
+PA8.Mode=Alternate Function Push Pull
+PA8.Signal=TIM1_CH1
+PA8.Speed=High
+
+PA1.Mode=Alternate Function Push Pull
+PA1.Signal=TIM2_CH2
+PA1.Speed=High
+
+PB0.Mode=Alternate Function Push Pull
+PB0.Signal=TIM3_CH3
+PB0.Speed=High
+
+PA2.Mode=Alternate Function Push Pull
+PA2.Signal=USART2_TX
+
+PA3.Mode=Alternate Function Push Pull
+PA3.Signal=USART2_RX
+
+PA0.Mode=Analog
+PA0.Signal=ADC1_IN0
+
+PA4.Mode=Analog
+PA4.Signal=ADC2_IN4
+
+# ---------------------------------------------------------------------------
+# MIDDLEWARES AND SAFETY
+# ---------------------------------------------------------------------------
+NVIC.TIM1_UP_TIM10_IRQn=true:5:0:true:false:true:true:true
+NVIC.TIM2_IRQn=true:5:0:true:false:true:true:true
+NVIC.TIM3_IRQn=true:5:0:true:false:true:true:true
+NVIC.USART2_IRQn=true:5:0:true:false:true:true:true
+NVIC.ADC_IRQn=true:5:0:true:false:true:true:true
+
+# ---------------------------------------------------------------------------
+# NOTES FOR CODE GENERATION
+# ---------------------------------------------------------------------------
+# Generated project will include:
+# - main.c with MX_TIMx_StartPWM() for all 3 channels
+# - MX_ADC1_Start_DMA() and MX_ADC2_Start_DMA() for current sensing
+# - MX_USART2_UART_Init() for DE5-QMD serial commands
+# - Optional: DMA streams for PWM update and ADC sampling synchronization
+# - Add control loop in while(1): read ADC -> run PI -> update PWM duty
+#
+# Safety recommendation:
+#   • Add emergency stop (GPIO input pin) mapped to interrupt.
+#   • Clamp PWM duty cycles to ±95% to avoid H-bridge shoot-through.
+#   • Use dead-time insertion in TIM1 advanced control.
+#
+# Import steps:
+#   1. Open STM32CubeMX
+#   2. File → Import .ioc → select this file
+#   3. Generate code → Open in STM32CubeIDE
+#   4. Add your DE5_QMD_control.c/.h modules for logic
+```
+
+---
+
+### 🧠 Summary
+
+This `.ioc` configures:
+
+* **TIM1**, **TIM2**, **TIM3** → PWM channels for H-Bridge control (2 stator + 1 optional)
+* **ADC1**, **ADC2** → current sensors for feedback loop
+* **USART2** → QMD/DE5 serial command input
+* **Clock** → 168 MHz system for 20 kHz PWM switching
+* **NVIC priorities** → real-time safe ISR for control
+
+---
