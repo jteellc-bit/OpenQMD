@@ -1,0 +1,259 @@
+1x1 controller 19 (DE5 - QMD Adaptive Control GUI)
+
+this next version extends the **DE5/QMD Adaptive Control GUI** to include
+✅ **Profile save/load** for PI tuning presets (e.g., “Eco”, “Aggressive”, “Balanced”)
+✅ Simple local JSON storage for persistence between runs
+✅ Drop-down selector and Save/Load buttons tied into the live UART updates
+
+You can run this code directly as `de5_gui_profiles.py` (same requirements: `pyqt5`, `pyserial`, `matplotlib`).
+
+---
+
+## 🧩 `de5_gui_profiles.py`
+
+```python
+import sys, time, json, threading, os
+from PyQt5 import QtWidgets, QtCore
+import serial, serial.tools.list_ports
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+
+# --------------------------------------------------------------------------
+# Serial manager
+# --------------------------------------------------------------------------
+class SerialManager:
+    def __init__(self):
+        self.ser = None
+        self.lock = threading.Lock()
+        self.buffer = []
+        self.running = True
+        threading.Thread(target=self.reader_thread, daemon=True).start()
+
+    def connect(self, baud=115200):
+        ports = list(serial.tools.list_ports.comports())
+        for p in ports:
+            try:
+                self.ser = serial.Serial(p.device, baud, timeout=0.05)
+                print(f"Connected: {p.device}")
+                return True
+            except:
+                continue
+        print("No serial port found.")
+        return False
+
+    def reader_thread(self):
+        while self.running:
+            if self.ser and self.ser.in_waiting:
+                line = self.ser.readline().decode(errors='ignore').strip()
+                if line:
+                    with self.lock:
+                        self.buffer.append(line)
+            time.sleep(0.01)
+
+    def send(self, cmd):
+        if self.ser:
+            self.ser.write((cmd + "\r\n").encode())
+
+    def get_lines(self):
+        with self.lock:
+            lines = self.buffer[:]
+            self.buffer.clear()
+        return lines
+
+# --------------------------------------------------------------------------
+# GUI main window
+# --------------------------------------------------------------------------
+class DE5GUI(QtWidgets.QWidget):
+    PROFILE_FILE = "pi_profiles.json"
+
+    def __init__(self):
+        super().__init__()
+        self.serial = SerialManager()
+        self.serial.connect()
+        self.load_profiles()
+        self.init_ui()
+
+        # data buffers
+        self.data_time, self.data_torque, self.data_eff = [], [], []
+        self.data_temp, self.data_current = [], [], []
+
+        self.start_time = time.time()
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_plot)
+        self.timer.start(100)
+        self.serial.send("STREAM ON")
+
+    # ----------------------------------------------------------------------
+    # UI setup
+    # ----------------------------------------------------------------------
+    def init_ui(self):
+        layout = QtWidgets.QVBoxLayout()
+
+        # --- Control buttons ---
+        ctrl_box = QtWidgets.QHBoxLayout()
+        self.start_btn = QtWidgets.QPushButton("Start")
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.row_box = QtWidgets.QSpinBox()
+        self.row_box.setRange(0, 999)
+        self.setrow_btn = QtWidgets.QPushButton("Set Row")
+        self.start_btn.clicked.connect(lambda: self.serial.send("START"))
+        self.stop_btn.clicked.connect(lambda: self.serial.send("STOP"))
+        self.setrow_btn.clicked.connect(lambda: self.serial.send(f"ROW {self.row_box.value()}"))
+        for w in [self.start_btn, self.stop_btn, self.row_box, self.setrow_btn]:
+            ctrl_box.addWidget(w)
+        layout.addLayout(ctrl_box)
+
+        # --- PI tuning box ---
+        pi_box = QtWidgets.QGroupBox("PI Gains (Live)")
+        pi_layout = QtWidgets.QGridLayout()
+
+        self.kp_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.kp_slider.setRange(1, 500)
+        self.ki_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.ki_slider.setRange(1, 200)
+        self.kp_label = QtWidgets.QLabel("Kp: 0.05")
+        self.ki_label = QtWidgets.QLabel("Ki: 0.001")
+
+        self.kp_slider.valueChanged.connect(self.update_pi)
+        self.ki_slider.valueChanged.connect(self.update_pi)
+        pi_layout.addWidget(self.kp_label, 0, 0)
+        pi_layout.addWidget(self.kp_slider, 0, 1)
+        pi_layout.addWidget(self.ki_label, 1, 0)
+        pi_layout.addWidget(self.ki_slider, 1, 1)
+        pi_box.setLayout(pi_layout)
+        layout.addWidget(pi_box)
+
+        # --- Profiles box ---
+        prof_box = QtWidgets.QGroupBox("PI Profiles")
+        prof_layout = QtWidgets.QHBoxLayout()
+        self.profile_combo = QtWidgets.QComboBox()
+        self.profile_combo.addItems(self.profiles.keys())
+        self.save_btn = QtWidgets.QPushButton("Save Current as Profile")
+        self.load_btn = QtWidgets.QPushButton("Load Selected Profile")
+        prof_layout.addWidget(self.profile_combo)
+        prof_layout.addWidget(self.save_btn)
+        prof_layout.addWidget(self.load_btn)
+        self.save_btn.clicked.connect(self.save_profile)
+        self.load_btn.clicked.connect(self.load_profile)
+        prof_box.setLayout(prof_layout)
+        layout.addWidget(prof_box)
+
+        # --- Plot ---
+        self.fig, self.ax = plt.subplots(2, 1, figsize=(6, 5))
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        layout.addWidget(self.canvas)
+
+        self.setLayout(layout)
+        self.setWindowTitle("DE5/QMD Adaptive Control GUI with PI Profiles")
+        self.show()
+
+    # ----------------------------------------------------------------------
+    # PI update and UART send
+    # ----------------------------------------------------------------------
+    def update_pi(self):
+        kp = self.kp_slider.value() / 1000.0
+        ki = self.ki_slider.value() / 1000.0
+        self.kp_label.setText(f"Kp: {kp:.3f}")
+        self.ki_label.setText(f"Ki: {ki:.3f}")
+        self.serial.send(f"PI {kp:.6f} {ki:.6f}")
+
+    # ----------------------------------------------------------------------
+    # Profile management
+    # ----------------------------------------------------------------------
+    def load_profiles(self):
+        if os.path.exists(self.PROFILE_FILE):
+            with open(self.PROFILE_FILE, "r") as f:
+                self.profiles = json.load(f)
+        else:
+            self.profiles = {
+                "Eco": {"kp": 0.05, "ki": 0.001},
+                "Balanced": {"kp": 0.12, "ki": 0.005},
+                "Aggressive": {"kp": 0.25, "ki": 0.01},
+            }
+
+    def save_profiles(self):
+        with open(self.PROFILE_FILE, "w") as f:
+            json.dump(self.profiles, f, indent=2)
+
+    def save_profile(self):
+        name, ok = QtWidgets.QInputDialog.getText(self, "Save Profile", "Enter profile name:")
+        if ok and name:
+            kp = self.kp_slider.value() / 1000.0
+            ki = self.ki_slider.value() / 1000.0
+            self.profiles[name] = {"kp": kp, "ki": ki}
+            self.profile_combo.addItem(name)
+            self.save_profiles()
+            QtWidgets.QMessageBox.information(self, "Saved", f"Profile '{name}' saved.")
+
+    def load_profile(self):
+        name = self.profile_combo.currentText()
+        if name in self.profiles:
+            kp = self.profiles[name]["kp"]
+            ki = self.profiles[name]["ki"]
+            self.kp_slider.setValue(int(kp * 1000))
+            self.ki_slider.setValue(int(ki * 1000))
+            self.update_pi()
+            QtWidgets.QMessageBox.information(self, "Loaded", f"Loaded profile '{name}'.")
+
+    # ----------------------------------------------------------------------
+    # Telemetry plot
+    # ----------------------------------------------------------------------
+    def update_plot(self):
+        lines = self.serial.get_lines()
+        for l in lines:
+            if l.startswith("DATA"):
+                try:
+                    _, t, tq, eff, temp, curr = l.split(",")
+                    self.data_time.append(float(t))
+                    self.data_torque.append(float(tq))
+                    self.data_eff.append(float(eff))
+                    self.data_temp.append(float(temp))
+                    self.data_current.append(float(curr))
+                except:
+                    pass
+
+        if len(self.data_time) > 200:
+            self.data_time = self.data_time[-200:]
+            self.data_torque = self.data_torque[-200:]
+            self.data_eff = self.data_eff[-200:]
+            self.data_temp = self.data_temp[-200:]
+            self.data_current = self.data_current[-200:]
+
+        self.ax[0].clear()
+        self.ax[0].plot(self.data_time, self.data_torque, label="Torque (Nm)")
+        self.ax[0].plot(self.data_time, self.data_eff, label="Efficiency")
+        self.ax[0].legend()
+        self.ax[0].set_ylabel("Torque / Eff")
+
+        self.ax[1].clear()
+        self.ax[1].plot(self.data_time, self.data_temp, label="Temp (°C)")
+        self.ax[1].plot(self.data_time, self.data_current, label="Current (A)")
+        self.ax[1].legend()
+        self.ax[1].set_xlabel("Time (s)")
+
+        self.canvas.draw_idle()
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    gui = DE5GUI()
+    sys.exit(app.exec_())
+```
+
+---
+
+### 🧠 Features Added
+
+| Feature                       | Description                                   |
+| ----------------------------- | --------------------------------------------- |
+| **Profiles JSON persistence** | Saved as `pi_profiles.json` locally           |
+| **Live profile switching**    | Changes Kp/Ki and sends UART update instantly |
+| **Default presets**           | Eco / Balanced / Aggressive                   |
+| **User-defined profiles**     | Add your own presets via dialog               |
+| **Real-time telemetry**       | Still fully active during tuning              |
+
+---
+
+
