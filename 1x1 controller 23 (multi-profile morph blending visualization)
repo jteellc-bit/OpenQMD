@@ -1,0 +1,492 @@
+1x1 controller 23 (multi-profile morph blending visualization)
+
+I added a **multi-profile morph blending visualization** to the GUI and made it robust & practical for your workflow. Below you’ll find a ready-to-run PyQt5 program (`de5_gui_profiles_morph_v2.py`) that:
+
+* loads DE5/PI profile CSVs (simple, well-documented format),
+* lets you pick two profiles (A and B),
+* lets you morph between them with a slider (μ from 0.0 → 1.0),
+* overlays Profile A, Profile B, and the blended profile for torque and efficiency,
+* optionally streams the morph value to the MCU (`MORPH <μ>`),
+* keeps all the adaptive learner and telemetry plotting features already present.
+
+I kept the interface lightweight and file-format-flexible: your profile CSV only needs columns `x` (shared independent axis — e.g., radius or time or RPM), `torque`, and `efficiency`. If the file has more columns, the loader ignores them.
+
+Save the file as `de5_gui_profiles_morph_v2.py`. Dependencies: `pyqt5`, `pyqtgraph`, `numpy`, `pyserial`. Install with:
+
+```bash
+pip install pyqt5 pyqtgraph numpy pyserial
+```
+
+---
+
+### What the GUI adds
+
+* File loader button (CSV). Loaded profiles show up in a list.
+* Two combo boxes to choose Profile A and Profile B.
+* Morph slider (0–100 → μ = 0.0–1.0) with numeric readout.
+* Blend checkbox: when checked, the GUI sends `MORPH <μ>` to the MCU automatically as you slide.
+* Overlay plot: Torque vs x and Efficiency vs x shown stacked; A (dashed), B (dotted), Blended (solid, highlighted).
+* Keeps the AdaptiveLearner & telemetry plots intact.
+
+---
+
+### The code
+
+```python
+# de5_gui_profiles_morph_v2.py
+# PyQt5 GUI: AdaptiveLearner + Multi-Profile Morph Blending Visualization
+# Save as de5_gui_profiles_morph_v2.py and run with: python de5_gui_profiles_morph_v2.py
+
+import sys, time, threading, json, os
+import numpy as np
+from PyQt5 import QtWidgets, QtCore
+import pyqtgraph as pg
+import serial, serial.tools.list_ports
+import csv
+
+# ------------------------------
+# Helper: profile loader
+# ------------------------------
+def load_profile_csv(path):
+    """
+    Expect CSV with columns: x, torque, efficiency
+    Returns dict: {'name': filename, 'x': np.array, 'torque': np.array, 'eff': np.array}
+    """
+    xs, tq, eff = [], [], []
+    with open(path, 'r') as f:
+        reader = csv.DictReader(f)
+        # try common names
+        for row in reader:
+            # tolerant parse
+            def try_get(klist):
+                for k in klist:
+                    if k in row and row[k] != '':
+                        return row[k]
+                return None
+            xval = try_get(['x','r','rpm','radius'])
+            tval = try_get(['torque','T','torque_Nm'])
+            eval_ = try_get(['eff','efficiency','eta'])
+            if xval is None or tval is None or eval_ is None:
+                continue
+            try:
+                xs.append(float(xval))
+                tq.append(float(tval))
+                eff.append(float(eval_))
+            except:
+                continue
+    if len(xs)==0:
+        raise ValueError("No usable rows in CSV (need columns x, torque, efficiency)")
+    # sort by x
+    arr = np.array([xs, tq, eff]).T
+    arr = arr[arr[:,0].argsort()]
+    return {'name': os.path.basename(path), 'x': arr[:,0], 'torque': arr[:,1], 'eff': arr[:,2]}
+
+# ------------------------------
+# AdaptiveLearner (kept minimal)
+# ------------------------------
+class AdaptiveLearner:
+    def __init__(self, serial_send, telemetry_getter,
+                 mu0=0.0, sigma0=0.12, lr=0.04, eval_window=2.0,
+                 baseline_decay=0.98, alpha_ramp_rate=0.2,
+                 save_path="adaptive_state.json"):
+        self.serial_send = serial_send
+        self.telemetry_getter = telemetry_getter
+        self.mu = float(mu0); self.sigma = float(sigma0); self.lr = float(lr)
+        self.eval_window = float(eval_window); self.baseline = 0.0
+        self.baseline_decay = float(baseline_decay); self.alpha_ramp_rate = float(alpha_ramp_rate)
+        self.running = False; self.history = []; self.save_path = save_path
+        self.min_sigma = 0.02; self.sigma_decay = 0.9995
+        self.last_alpha = self.mu; self.last_time = time.time()
+        # reward weights (modifiable externally)
+        self.w_eff, self.w_tq, self.w_temp = 0.5, 0.4, 0.6
+        # normalization/punishment bounds (tunable)
+        self.eff_min, self.eff_max = 0.6, 1.0
+        self.tq_min, self.tq_max = 0.0, 10000.0
+        self.T_safe, self.T_max = 60.0, 140.0
+        self._load_state()
+
+    def _clip(self, x): return max(0.0, min(1.0, x))
+
+    def _ramp_alpha(self, a_target):
+        tnow = time.time()
+        dt = max(1e-3, tnow - self.last_time)
+        max_delta = self.alpha_ramp_rate * dt
+        delta = a_target - self.last_alpha
+        if abs(delta) > max_delta:
+            delta = np.sign(delta) * max_delta
+        self.last_alpha += delta
+        self.last_time = tnow
+        return self.last_alpha
+
+    def _normalize(self, v, vmin, vmax):
+        if vmax <= vmin: return 0.5
+        return max(0.0, min(1.0, (v - vmin) / (vmax - vmin)))
+
+    def _reward(self, tel):
+        eff = tel.get('eff', 0); tq = tel.get('torque', 0); T = tel.get('temp', 999)
+        eff_s = self._normalize(eff, self.eff_min, self.eff_max)
+        tq_s = self._normalize(tq, self.tq_min, self.tq_max)
+        temp_pen = max(0.0, (T - self.T_safe) / (self.T_max - self.T_safe))
+        return self.w_eff * eff_s + self.w_tq * tq_s - self.w_temp * temp_pen
+
+    def start(self):
+        if self.running: return
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True); self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if hasattr(self, "thread"): self.thread.join(timeout=1.0)
+        self._save_state()
+
+    def _loop(self):
+        while self.running:
+            a = np.random.normal(self.mu, self.sigma); a = self._clip(a)
+            a_send = self._ramp_alpha(a)
+            try: self.serial_send(f"MORPH {a_send:.6f}")
+            except: pass
+            t0 = time.time(); tel_accum = {}; count = 0
+            while time.time() - t0 < self.eval_window and self.running:
+                tel = self.telemetry_getter()
+                if tel:
+                    count += 1
+                    for k,v in tel.items():
+                        tel_accum[k] = tel_accum.get(k,0)+v
+                time.sleep(0.05)
+            if count==0: R = -0.1
+            else:
+                for k in tel_accum: tel_accum[k] /= count
+                R = self._reward(tel_accum)
+            self.baseline = self.baseline*self.baseline_decay + (1-self.baseline_decay)*R
+            adv = R - self.baseline
+            if self.sigma > 1e-6:
+                grad = (a - self.mu) / (self.sigma**2)
+                self.mu += self.lr * adv * grad
+            self.sigma = max(self.min_sigma, self.sigma*self.sigma_decay)
+            self.history.append({'t':time.time(),'alpha':a,'reward':R,'mu':self.mu,'sigma':self.sigma})
+            if len(self.history) % 20 == 0: self._save_state()
+        self._save_state()
+
+    def _save_state(self):
+        try:
+            json.dump({'mu':self.mu,'sigma':self.sigma,'history':self.history[-2000:]},
+                      open(self.save_path,'w'))
+        except: pass
+
+    def _load_state(self):
+        if os.path.exists(self.save_path):
+            try:
+                s=json.load(open(self.save_path))
+                self.mu=s.get('mu',self.mu); self.sigma=s.get('sigma',self.sigma)
+                self.history=s.get('history',[])
+            except: pass
+
+# ------------------------------
+# Main GUI
+# ------------------------------
+class DE5Gui(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("DE5 Adaptive Morph + Multi-Profile Morph Visualizer")
+        self.resize(1200,800)
+        self.serial = None; self.last_telemetry = {}
+        self.profiles = []  # list of dicts
+
+        # Layouts
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Top control row: serial + profile load
+        top_row = QtWidgets.QHBoxLayout()
+        self.port_cb = QtWidgets.QComboBox(); self.refresh_btn = QtWidgets.QPushButton("Refresh Ports")
+        self.connect_btn = QtWidgets.QPushButton("Connect"); self.disconnect_btn = QtWidgets.QPushButton("Disconnect")
+        self.load_profile_btn = QtWidgets.QPushButton("Load Profile CSV")
+        top_row.addWidget(self.port_cb); top_row.addWidget(self.refresh_btn)
+        top_row.addWidget(self.connect_btn); top_row.addWidget(self.disconnect_btn)
+        top_row.addStretch(); top_row.addWidget(self.load_profile_btn)
+        layout.addLayout(top_row)
+
+        # Profile selection + morph controls
+        pbox = QtWidgets.QGroupBox("Profile Morphing")
+        pgrid = QtWidgets.QGridLayout()
+        pbox.setLayout(pgrid)
+        self.profileA_cb = QtWidgets.QComboBox(); self.profileB_cb = QtWidgets.QComboBox()
+        self.auto_send_chk = QtWidgets.QCheckBox("Auto-send MORPH")
+        self.morph_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.morph_slider.setRange(0,100); self.morph_slider.setValue(0)
+        self.morph_spin = QtWidgets.QDoubleSpinBox(); self.morph_spin.setRange(0.0,1.0); self.morph_spin.setSingleStep(0.01); self.morph_spin.setValue(0.0)
+        pgrid.addWidget(QtWidgets.QLabel("Profile A:"), 0, 0); pgrid.addWidget(self.profileA_cb, 0, 1)
+        pgrid.addWidget(QtWidgets.QLabel("Profile B:"), 0, 2); pgrid.addWidget(self.profileB_cb, 0, 3)
+        pgrid.addWidget(QtWidgets.QLabel("Morph μ:"), 1, 0); pgrid.addWidget(self.morph_slider, 1, 1, 1, 2); pgrid.addWidget(self.morph_spin, 1, 3)
+        pgrid.addWidget(self.auto_send_chk, 2, 0, 1, 1)
+        layout.addWidget(pbox)
+
+        # Plot area: torque + efficiency stacked
+        self.plot_torque = pg.PlotWidget(title="Torque vs x"); self.plot_eff = pg.PlotWidget(title="Efficiency vs x")
+        self.plot_torque.getPlotItem().showGrid(True, True); self.plot_eff.getPlotItem().showGrid(True, True)
+        layout.addWidget(self.plot_torque, 2)
+        layout.addWidget(self.plot_eff, 1)
+
+        # lower area: learner controls + telemetry plots
+        lower = QtWidgets.QHBoxLayout()
+        # learner controls
+        learner_box = QtWidgets.QGroupBox("Adaptive Learner")
+        llayout = QtWidgets.QVBoxLayout()
+        self.start_btn = QtWidgets.QPushButton("Start Learner"); self.stop_btn = QtWidgets.QPushButton("Stop Learner")
+        llayout.addWidget(self.start_btn); llayout.addWidget(self.stop_btn)
+        learner_box.setLayout(llayout)
+        lower.addWidget(learner_box)
+
+        # telemetry plots (mu & reward)
+        self.plot_mu = pg.PlotWidget(title="μ (learner)"); self.plot_reward = pg.PlotWidget(title="Reward")
+        lower.addWidget(self.plot_mu); lower.addWidget(self.plot_reward)
+        layout.addLayout(lower)
+
+        # status
+        self.status_lbl = QtWidgets.QLabel("Status: Idle"); layout.addWidget(self.status_lbl)
+
+        # plotting curves storage
+        self.curves = {}
+        self._init_plot_curves()
+
+        # Bind events
+        self.refresh_btn.clicked.connect(self.refresh_ports); self.connect_btn.clicked.connect(self.connect_serial)
+        self.disconnect_btn.clicked.connect(self.disconnect_serial); self.load_profile_btn.clicked.connect(self.on_load_profile)
+        self.morph_slider.valueChanged.connect(self.on_slider_changed); self.morph_spin.valueChanged.connect(self.on_spin_changed)
+        self.profileA_cb.currentIndexChanged.connect(self.update_overlay); self.profileB_cb.currentIndexChanged.connect(self.update_overlay)
+        self.auto_send_chk.setChecked(True)
+
+        # learner
+        self.learner = AdaptiveLearner(serial_send=self.send_cmd, telemetry_getter=self.get_telemetry)
+        self.start_btn.clicked.connect(self.start_learner); self.stop_btn.clicked.connect(self.stop_learner)
+
+        # serial reader thread support
+        self.serial_thread = None
+
+        # gui updater
+        self.timer = QtCore.QTimer(); self.timer.timeout.connect(self.update_gui); self.timer.start(300)
+        self.refresh_ports()
+
+    def _init_plot_curves(self):
+        # torque
+        self.curves['A_tq'] = self.plot_torque.plot(pen=pg.mkPen('y', style=QtCore.Qt.DashLine), name='A')
+        self.curves['B_tq'] = self.plot_torque.plot(pen=pg.mkPen('c', style=QtCore.Qt.DotLine), name='B')
+        self.curves['M_tq'] = self.plot_torque.plot(pen=pg.mkPen('r', width=2), name='Morph')
+        # efficiency
+        self.curves['A_eff'] = self.plot_eff.plot(pen=pg.mkPen('y', style=QtCore.Qt.DashLine))
+        self.curves['B_eff'] = self.plot_eff.plot(pen=pg.mkPen('c', style=QtCore.Qt.DotLine))
+        self.curves['M_eff'] = self.plot_eff.plot(pen=pg.mkPen('r', width=2))
+
+        # learner curves
+        self.curve_mu = self.plot_mu.plot(pen='w'); self.curve_reward = self.plot_reward.plot(pen='g')
+
+    # -------------------------
+    # Serial I/O
+    # -------------------------
+    def refresh_ports(self):
+        self.port_cb.clear()
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port_cb.addItems(ports)
+
+    def connect_serial(self):
+        port = self.port_cb.currentText()
+        try:
+            self.serial = serial.Serial(port, 115200, timeout=0.1)
+            self.status_lbl.setText(f"Connected {port}")
+            self.serial_thread = threading.Thread(target=self.serial_reader, daemon=True); self.serial_thread.start()
+        except Exception as e:
+            self.status_lbl.setText(f"Serial connect error: {e}")
+
+    def disconnect_serial(self):
+        if self.serial:
+            try: self.serial.close()
+            except: pass
+            self.serial = None
+            self.status_lbl.setText("Disconnected")
+
+    def send_cmd(self, cmd:str):
+        if self.serial and self.serial.is_open:
+            try:
+                self.serial.write((cmd+"\n").encode())
+            except Exception as e:
+                print("serial send err", e)
+
+    def serial_reader(self):
+        while self.serial and self.serial.is_open:
+            try:
+                line = self.serial.readline().decode(errors='ignore').strip()
+                if not line: 
+                    time.sleep(0.01); continue
+                # telemetry line format: DATA,<t>,<torque>,<eff>,<temp>,<current>
+                if line.startswith("DATA"):
+                    parts = line.split(',')
+                    if len(parts) >= 6:
+                        self.last_telemetry = {'time':float(parts[1]),
+                                               'torque':float(parts[2]),
+                                               'eff':float(parts[3]),
+                                               'temp':float(parts[4]),
+                                               'current':float(parts[5])}
+                # optional: parse feedback about active row etc.
+            except Exception:
+                time.sleep(0.02)
+
+    def get_telemetry(self):
+        return self.last_telemetry.copy() if self.last_telemetry else None
+
+    # -------------------------
+    # Profile Loading / UI
+    # -------------------------
+    def on_load_profile(self):
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load profile CSV", ".", "CSV Files (*.csv);;All Files (*)")
+        if not fn: return
+        try:
+            prof = load_profile_csv(fn)
+            self.profiles.append(prof)
+            self.profileA_cb.addItem(prof['name'])
+            self.profileB_cb.addItem(prof['name'])
+            # auto-select last two if at least two
+            if len(self.profiles) >= 2:
+                self.profileA_cb.setCurrentIndex(len(self.profiles)-2)
+                self.profileB_cb.setCurrentIndex(len(self.profiles)-1)
+            self.update_overlay()
+            self.status_lbl.setText(f"Loaded profile: {prof['name']}")
+        except Exception as e:
+            self.status_lbl.setText(f"Profile load error: {e}")
+
+    def get_selected_profiles(self):
+        ia = max(0, self.profileA_cb.currentIndex())
+        ib = max(0, self.profileB_cb.currentIndex())
+        if ia < len(self.profiles): A = self.profiles[ia]
+        else: A = None
+        if ib < len(self.profiles): B = self.profiles[ib]
+        else: B = None
+        return A, B
+
+    def interpolate_profiles(self, A, B, mu):
+        """
+        Produce blended profile on a common x-grid.
+        Approach: union x values -> linear interpolate torque/eff for each, then blend.
+        """
+        # if only one profile present, return it
+        if A is None and B is None: return None
+        if A is None: return {'x': B['x'], 'torque': B['torque'], 'eff': B['eff']}
+        if B is None: return {'x': A['x'], 'torque': A['torque'], 'eff': A['eff']}
+        # build common x grid: union of unique sorted points or a regular grid between min/max
+        xmin = min(A['x'].min(), B['x'].min()); xmax = max(A['x'].max(), B['x'].max())
+        xgrid = np.linspace(xmin, xmax, 300)
+        # interp
+        tA = np.interp(xgrid, A['x'], A['torque'], left=A['torque'][0], right=A['torque'][-1])
+        tB = np.interp(xgrid, B['x'], B['torque'], left=B['torque'][0], right=B['torque'][-1])
+        eA = np.interp(xgrid, A['x'], A['eff'], left=A['eff'][0], right=A['eff'][-1])
+        eB = np.interp(xgrid, B['x'], B['eff'], left=B['eff'][0], right=B['eff'][-1])
+        tM = (1.0-mu)*tA + mu*tB
+        eM = (1.0-mu)*eA + mu*eB
+        return {'x': xgrid, 'torque': tM, 'eff': eM, 'Ax':A['x'], 'Bx':B['x'], 'tA':tA, 'tB':tB, 'eA':eA, 'eB':eB}
+
+    def update_overlay(self):
+        mu = self.morph_spin.value()
+        A, B = self.get_selected_profiles()
+        merged = self.interpolate_profiles(A, B, mu)
+        # clear & update A,B,M curves
+        if A:
+            # plot original A on its x (interpolated to merged.x if possible)
+            if merged:
+                self.curves['A_tq'].setData(merged['x'], merged['tA'])
+                self.curves['A_eff'].setData(merged['x'], merged['eA'])
+            else:
+                self.curves['A_tq'].setData(A['x'], A['torque'])
+                self.curves['A_eff'].setData(A['x'], A['eff'])
+        else:
+            self.curves['A_tq'].clear(); self.curves['A_eff'].clear()
+        if B:
+            if merged:
+                self.curves['B_tq'].setData(merged['x'], merged['tB'])
+                self.curves['B_eff'].setData(merged['x'], merged['eB'])
+            else:
+                self.curves['B_tq'].setData(B['x'], B['torque'])
+                self.curves['B_eff'].setData(B['x'], B['eff'])
+        else:
+            self.curves['B_tq'].clear(); self.curves['B_eff'].clear()
+        if merged:
+            self.curves['M_tq'].setData(merged['x'], merged['torque'])
+            self.curves['M_eff'].setData(merged['x'], merged['eff'])
+        else:
+            self.curves['M_tq'].clear(); self.curves['M_eff'].clear()
+
+    # -------------------------
+    # UI callbacks
+    # -------------------------
+    def on_slider_changed(self, val):
+        mu = val / 100.0
+        self.morph_spin.blockSignals(True); self.morph_spin.setValue(mu); self.morph_spin.blockSignals(False)
+        self.update_overlay()
+        if self.auto_send_chk.isChecked():
+            self.send_cmd(f"MORPH {mu:.6f}")
+
+    def on_spin_changed(self, val):
+        s = int(round(val * 100))
+        self.morph_slider.blockSignals(True); self.morph_slider.setValue(s); self.morph_slider.blockSignals(False)
+        self.update_overlay()
+        if self.auto_send_chk.isChecked():
+            self.send_cmd(f"MORPH {val:.6f}")
+
+    # -------------------------
+    # Learner controls & GUI update
+    # -------------------------
+    def start_learner(self):
+        self.learner.w_eff = 0.5; self.learner.w_tq = 0.4; self.learner.w_temp = 0.6
+        self.learner.start(); self.status_lbl.setText("Learner: RUNNING")
+
+    def stop_learner(self):
+        self.learner.stop(); self.status_lbl.setText("Learner: STOPPED")
+
+    def update_gui(self):
+        # plot learner history
+        hist = self.learner.history
+        if len(hist) > 5:
+            t0 = hist[0]['t']
+            tt = np.array([h['t'] - t0 for h in hist])
+            mu = np.array([h['mu'] for h in hist])
+            R = np.array([h['reward'] for h in hist])
+            self.curve_mu.setData(tt, mu)
+            self.curve_reward.setData(tt, R)
+        # telemetry status
+        if self.last_telemetry:
+            self.status_lbl.setText(f"μ={self.learner.mu:.3f} | last teleq: T={self.last_telemetry.get('temp',np.nan):.1f}C E={self.last_telemetry.get('eff',np.nan):.3f} Tq={self.last_telemetry.get('torque',np.nan):.2f}")
+        self.update_overlay()
+
+# ------------------------------
+# Run App
+# ------------------------------
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    win = DE5Gui()
+    win.show()
+    sys.exit(app.exec_())
+```
+
+---
+
+### File format for profiles (example)
+
+Create CSV files like `profile_A.csv`, `profile_B.csv` with headers and numeric rows:
+
+```
+x,torque,efficiency
+0.0,0.0,0.75
+10.0,5.5,0.78
+20.0,11.2,0.80
+30.0,18.0,0.82
+...
+```
+
+`x` can be radius (kpc), rpm, time or any independent axis the curves share conceptually; the GUI will interpolate them onto a common grid for blending.
+
+---
+
+### Next steps I can add if you want
+
+* Overlay the actual DE5 parameter curves (if you instead store parameter vectors per-row and need a generator that produces torque/eff curves from parameters).
+* Export blended curve to CSV / generate FEM input rows directly from blended profiles.
+* Add smoothing/regularization when blending very different profiles.
+* Add "persist morph schedule" (time sequence of μ steps) and automatic replay to the MCU.
+
+---
