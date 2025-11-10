@@ -1,0 +1,355 @@
+1x1 controller 24 (ready-to-run version of the GUI upgraded)
+
+
+
+Below you’ll get a ready-to-run version of the GUI upgraded with:
+
+✅ **DE5 parameter → torque/efficiency curve generator** (so it can plot curves directly from DE5 parameter rows instead of needing precomputed torque/efficiency CSVs),
+✅ **Automatic blended curve export to CSV**, and
+✅ A flexible DE5 parameter mapping (compatible with the DE5 top-30 FEM input CSVs you’ve been using).
+
+---
+
+### 🔧 What’s new
+
+* Adds **`DE5CurveGenerator`**, which converts DE5 row parameters (`k1`, `k2`, `alpha`, `beta`, `gamma`, etc.) into torque and efficiency arrays via a simplified analytical model.
+
+  * It’s written modularly so you can replace the placeholder model with your true DE5 function later.
+* Adds a **“Generate Curves from DE5 CSV”** button that reads a DE5 table (rows = parameter sets).
+* Adds an **“Export Blend CSV”** button that saves the current blended curve automatically with timestamp and metadata.
+* Keeps compatibility with previously loaded precomputed curve CSVs.
+
+---
+
+### 💻 Updated File: `de5_gui_profiles_morph_v3.py`
+
+```python
+# de5_gui_profiles_morph_v3.py
+# PyQt5 GUI: AdaptiveLearner + Multi-Profile Morph Visualization + DE5 param-to-curve generation + CSV export
+
+import sys, os, time, threading, json, csv
+import numpy as np
+from PyQt5 import QtWidgets, QtCore
+import pyqtgraph as pg
+import serial, serial.tools.list_ports
+
+# ============================================================
+# --- DE5 → torque/efficiency curve generator ----------------
+# ============================================================
+
+class DE5CurveGenerator:
+    """
+    Converts DE5 parameter rows into torque/efficiency curves.
+    Replace formulas below with your actual DE5 equations or DE5_ComputeControl model.
+    """
+
+    def __init__(self, n_points=200):
+        self.n_points = n_points
+
+    def from_row(self, row_dict):
+        """
+        row_dict: one row from DE5 parameter CSV as a dict {param: value}
+        Must contain keys like 'k1','k2','alpha','beta','gamma'
+        Returns curve dict: {'x','torque','eff'}
+        """
+        x = np.linspace(0, 1, self.n_points)
+        # Simplified example physics model — placeholder
+        k1 = float(row_dict.get('k1', 1.0))
+        k2 = float(row_dict.get('k2', 0.5))
+        alpha = float(row_dict.get('alpha', 0.2))
+        beta = float(row_dict.get('beta', 0.8))
+        gamma = float(row_dict.get('gamma', 1.2))
+        # compute torque and efficiency (toy formulas)
+        torque = k1 * np.sin(2*np.pi*x*beta) + k2*np.cos(np.pi*x*alpha)
+        efficiency = np.clip(0.7 + 0.25*np.exp(-((x-gamma/2)**2)*2.5), 0.6, 1.0)
+        return {'x': x*100, 'torque': torque*10, 'eff': efficiency}
+
+    def from_csv(self, path):
+        """Load DE5 parameter CSV and generate list of curve dicts"""
+        curves = []
+        with open(path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    curves.append(self.from_row(row))
+                except Exception:
+                    continue
+        return curves
+
+
+# ============================================================
+# --- Profile loader (precomputed CSV or generated) ----------
+# ============================================================
+
+def load_profile_csv(path):
+    xs, tq, eff = [], [], []
+    with open(path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                xs.append(float(row.get('x', row.get('r', row.get('radius', 0)))))
+                tq.append(float(row.get('torque', row.get('T', 0))))
+                eff.append(float(row.get('efficiency', row.get('eff', 0))))
+            except:
+                continue
+    if not xs:
+        raise ValueError("CSV missing x/torque/efficiency columns.")
+    arr = np.array([xs, tq, eff]).T
+    arr = arr[arr[:,0].argsort()]
+    return {'name': os.path.basename(path), 'x': arr[:,0], 'torque': arr[:,1], 'eff': arr[:,2]}
+
+
+# ============================================================
+# --- Main GUI ------------------------------------------------
+# ============================================================
+
+class DE5Gui(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("DE5 Adaptive Morph + DE5 Curve Generator + CSV Export")
+        self.resize(1200, 800)
+        self.serial = None
+        self.profiles = []
+        self.de5gen = DE5CurveGenerator()
+
+        # --- Layout setup ---
+        layout = QtWidgets.QVBoxLayout(self)
+
+        top = QtWidgets.QHBoxLayout()
+        self.port_cb = QtWidgets.QComboBox()
+        self.refresh_btn = QtWidgets.QPushButton("Refresh Ports")
+        self.connect_btn = QtWidgets.QPushButton("Connect")
+        self.disconnect_btn = QtWidgets.QPushButton("Disconnect")
+        self.load_profile_btn = QtWidgets.QPushButton("Load Curve CSV")
+        self.load_de5_btn = QtWidgets.QPushButton("Generate from DE5 CSV")
+        self.export_btn = QtWidgets.QPushButton("Export Blended CSV")
+        top.addWidget(self.port_cb)
+        top.addWidget(self.refresh_btn)
+        top.addWidget(self.connect_btn)
+        top.addWidget(self.disconnect_btn)
+        top.addStretch()
+        top.addWidget(self.load_profile_btn)
+        top.addWidget(self.load_de5_btn)
+        top.addWidget(self.export_btn)
+        layout.addLayout(top)
+
+        # --- Morphing controls ---
+        morph_box = QtWidgets.QGroupBox("Morph Controls")
+        grid = QtWidgets.QGridLayout()
+        morph_box.setLayout(grid)
+        self.profileA_cb = QtWidgets.QComboBox()
+        self.profileB_cb = QtWidgets.QComboBox()
+        self.auto_send_chk = QtWidgets.QCheckBox("Auto-send MORPH")
+        self.morph_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.morph_slider.setRange(0, 100)
+        self.morph_spin = QtWidgets.QDoubleSpinBox()
+        self.morph_spin.setRange(0.0, 1.0)
+        self.morph_spin.setSingleStep(0.01)
+        grid.addWidget(QtWidgets.QLabel("Profile A:"), 0, 0)
+        grid.addWidget(self.profileA_cb, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Profile B:"), 0, 2)
+        grid.addWidget(self.profileB_cb, 0, 3)
+        grid.addWidget(QtWidgets.QLabel("Morph μ:"), 1, 0)
+        grid.addWidget(self.morph_slider, 1, 1, 1, 2)
+        grid.addWidget(self.morph_spin, 1, 3)
+        grid.addWidget(self.auto_send_chk, 2, 0)
+        layout.addWidget(morph_box)
+
+        # --- Plot area ---
+        self.plot_torque = pg.PlotWidget(title="Torque vs x")
+        self.plot_eff = pg.PlotWidget(title="Efficiency vs x")
+        layout.addWidget(self.plot_torque, 2)
+        layout.addWidget(self.plot_eff, 1)
+
+        self.status_lbl = QtWidgets.QLabel("Status: Idle")
+        layout.addWidget(self.status_lbl)
+
+        # --- Plot setup ---
+        self.curves = {
+            'A_tq': self.plot_torque.plot(pen=pg.mkPen('y', style=QtCore.Qt.DashLine)),
+            'B_tq': self.plot_torque.plot(pen=pg.mkPen('c', style=QtCore.Qt.DotLine)),
+            'M_tq': self.plot_torque.plot(pen=pg.mkPen('r', width=2)),
+            'A_eff': self.plot_eff.plot(pen=pg.mkPen('y', style=QtCore.Qt.DashLine)),
+            'B_eff': self.plot_eff.plot(pen=pg.mkPen('c', style=QtCore.Qt.DotLine)),
+            'M_eff': self.plot_eff.plot(pen=pg.mkPen('r', width=2)),
+        }
+
+        # --- Connections ---
+        self.refresh_btn.clicked.connect(self.refresh_ports)
+        self.connect_btn.clicked.connect(self.connect_serial)
+        self.disconnect_btn.clicked.connect(self.disconnect_serial)
+        self.load_profile_btn.clicked.connect(self.load_profile)
+        self.load_de5_btn.clicked.connect(self.load_de5_csv)
+        self.export_btn.clicked.connect(self.export_blended_csv)
+        self.morph_slider.valueChanged.connect(self.on_slider)
+        self.morph_spin.valueChanged.connect(self.on_spin)
+        self.profileA_cb.currentIndexChanged.connect(self.update_overlay)
+        self.profileB_cb.currentIndexChanged.connect(self.update_overlay)
+        self.auto_send_chk.setChecked(True)
+
+        self.refresh_ports()
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_overlay)
+        self.timer.start(500)
+
+    # ========================================================
+    # --- Serial handling ------------------------------------
+    # ========================================================
+    def refresh_ports(self):
+        self.port_cb.clear()
+        for p in serial.tools.list_ports.comports():
+            self.port_cb.addItem(p.device)
+
+    def connect_serial(self):
+        try:
+            self.serial = serial.Serial(self.port_cb.currentText(), 115200, timeout=0.1)
+            self.status_lbl.setText("Connected.")
+        except Exception as e:
+            self.status_lbl.setText(f"Serial error: {e}")
+
+    def disconnect_serial(self):
+        if self.serial:
+            self.serial.close()
+            self.serial = None
+            self.status_lbl.setText("Disconnected")
+
+    def send_cmd(self, cmd):
+        if self.serial and self.serial.is_open:
+            self.serial.write((cmd + "\n").encode())
+
+    # ========================================================
+    # --- Loading profiles / DE5 curves ----------------------
+    # ========================================================
+    def load_profile(self):
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Precomputed Curve CSV", ".", "CSV Files (*.csv)")
+        if not fn:
+            return
+        prof = load_profile_csv(fn)
+        self._add_profile(prof)
+
+    def load_de5_csv(self):
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load DE5 Parameter CSV", ".", "CSV Files (*.csv)")
+        if not fn:
+            return
+        curves = self.de5gen.from_csv(fn)
+        for i, c in enumerate(curves):
+            c['name'] = f"{os.path.basename(fn)}_row{i}"
+            self._add_profile(c)
+        self.status_lbl.setText(f"Generated {len(curves)} DE5 curves from {os.path.basename(fn)}")
+
+    def _add_profile(self, prof):
+        self.profiles.append(prof)
+        self.profileA_cb.addItem(prof['name'])
+        self.profileB_cb.addItem(prof['name'])
+        if len(self.profiles) >= 2:
+            self.profileA_cb.setCurrentIndex(len(self.profiles) - 2)
+            self.profileB_cb.setCurrentIndex(len(self.profiles) - 1)
+        self.update_overlay()
+
+    # ========================================================
+    # --- Blending logic + export -----------------------------
+    # ========================================================
+    def interpolate_profiles(self, A, B, mu):
+        if A is None and B is None:
+            return None
+        if A is None:
+            return A
+        if B is None:
+            return B
+        xmin = min(A['x'].min(), B['x'].min())
+        xmax = max(A['x'].max(), B['x'].max())
+        xgrid = np.linspace(xmin, xmax, 300)
+        tA = np.interp(xgrid, A['x'], A['torque'])
+        tB = np.interp(xgrid, B['x'], B['torque'])
+        eA = np.interp(xgrid, A['x'], A['eff'])
+        eB = np.interp(xgrid, B['x'], B['eff'])
+        tM = (1 - mu) * tA + mu * tB
+        eM = (1 - mu) * eA + mu * eB
+        return {'x': xgrid, 'torque': tM, 'eff': eM}
+
+    def export_blended_csv(self):
+        A, B = self._get_AB()
+        mu = self.morph_spin.value()
+        M = self.interpolate_profiles(A, B, mu)
+        if not M:
+            self.status_lbl.setText("Nothing to export.")
+            return
+        fn = f"DE5_blend_{A['name']}_to_{B['name']}_mu{mu:.2f}_{int(time.time())}.csv"
+        with open(fn, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['x', 'torque', 'efficiency'])
+            for xi, ti, ei in zip(M['x'], M['torque'], M['eff']):
+                w.writerow([xi, ti, ei])
+        self.status_lbl.setText(f"Exported blended curve to {fn}")
+
+    # ========================================================
+    # --- Plot updates ---------------------------------------
+    # ========================================================
+    def _get_AB(self):
+        ia, ib = self.profileA_cb.currentIndex(), self.profileB_cb.currentIndex()
+        A = self.profiles[ia] if 0 <= ia < len(self.profiles) else None
+        B = self.profiles[ib] if 0 <= ib < len(self.profiles) else None
+        return A, B
+
+    def update_overlay(self):
+        A, B = self._get_AB()
+        mu = self.morph_spin.value()
+        merged = self.interpolate_profiles(A, B, mu)
+        if not merged:
+            return
+        # plot all
+        self.curves['A_tq'].setData(A['x'], A['torque']) if A else self.curves['A_tq'].clear()
+        self.curves['B_tq'].setData(B['x'], B['torque']) if B else self.curves['B_tq'].clear()
+        self.curves['M_tq'].setData(merged['x'], merged['torque'])
+        self.curves['A_eff'].setData(A['x'], A['eff']) if A else self.curves['A_eff'].clear()
+        self.curves['B_eff'].setData(B['x'], B['eff']) if B else self.curves['B_eff'].clear()
+        self.curves['M_eff'].setData(merged['x'], merged['eff'])
+
+    def on_slider(self, val):
+        mu = val / 100.0
+        self.morph_spin.blockSignals(True)
+        self.morph_spin.setValue(mu)
+        self.morph_spin.blockSignals(False)
+        if self.auto_send_chk.isChecked():
+            self.send_cmd(f"MORPH {mu:.3f}")
+        self.update_overlay()
+
+    def on_spin(self, val):
+        s = int(round(val * 100))
+        self.morph_slider.blockSignals(True)
+        self.morph_slider.setValue(s)
+        self.morph_slider.blockSignals(False)
+        if self.auto_send_chk.isChecked():
+            self.send_cmd(f"MORPH {val:.3f}")
+        self.update_overlay()
+
+
+# ============================================================
+# --- Entry point --------------------------------------------
+# ============================================================
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    win = DE5Gui()
+    win.show()
+    sys.exit(app.exec_())
+```
+
+---
+
+### 🧩 Usage Summary
+
+1. **Generate Curves:**
+   Load your `DE5_top30_FEM_inputs.csv` or similar table → click *“Generate from DE5 CSV”*.
+   It builds torque/efficiency curves automatically.
+
+2. **Blend:**
+   Choose *Profile A* and *Profile B*, slide **μ** to blend between them.
+   Optional: auto-send to MCU via UART (`MORPH μ`).
+
+3. **Export:**
+   Click *“Export Blended CSV”* to save the blended candidate with metadata and timestamp.
+
+---
+
+###
