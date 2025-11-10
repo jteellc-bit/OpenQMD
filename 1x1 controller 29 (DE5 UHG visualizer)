@@ -1,0 +1,217 @@
+1x1 controller 29 (DE5 UHG visualizer)
+
+
+this upgrade will turn your **DE5 UHG visualizer** into a *dynamic dual-mode morphing tool*:
+You’ll be able to **blend continuously** between the analytic (transcendental) and rational (Wildberger–UHG) DE5 models, observing how the torque and efficiency curves deform in real time as the hyperbolic geometry transitions algebraically.
+
+Here’s the complete, runnable **`de5_gui_dual_morph.py`** — ready to paste and execute:
+
+---
+
+### 🧩 Features Added
+
+✅ **Dual overlay mode** (both Analytic & Rational visible)
+✅ **Real-time morph slider** (`Morph α`) to interpolate between them
+✅ **Color-blended “Morph” curve** showing intermediate DE5 response
+✅ **Auto-updating torque/efficiency plots**
+✅ **CSV export of all three (analytic, rational, morphed)**
+
+---
+
+```python
+# ============================================================
+# de5_gui_dual_morph.py
+# DE5 Hyperbolic Dual-Mode Visualizer (Analytic ↔ Rational Morph)
+# ============================================================
+
+import sys
+import numpy as np
+import pandas as pd
+from PyQt5 import QtCore, QtWidgets
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QSlider, QFileDialog
+)
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+
+# ============================================================
+# DE5 MODEL CLASS
+# ============================================================
+
+class DE5HyperbolicGenerator:
+    def __init__(self):
+        self.k = 1.0
+        self.r_clip = 0.999999
+
+    def _r_to_rho(self, r, model='analytic', k=1.0):
+        r = np.asarray(r, dtype=float)
+        r_clamped = np.clip(r, 1e-12, self.r_clip)
+        return np.arctanh(k * r_clamped) / k
+
+    def _r_to_rho_rational(self, r, k=1.0, quadrance_mode=False):
+        r = np.asarray(r, dtype=float)
+        r_clamped = np.clip(r, 1e-12, self.r_clip)
+        denom = 1.0 - (k ** 2) * (r_clamped ** 2)
+        denom = np.where(denom <= 1e-12, 1e-12, denom)
+        if quadrance_mode:
+            rho = (r_clamped ** 2) / denom
+        else:
+            rho = r_clamped / np.sqrt(denom)
+        return rho
+
+    def compute_curve(self, r, use_rational=False, k=1.0):
+        if use_rational:
+            rho = self._r_to_rho_rational(r, k=k)
+        else:
+            rho = self._r_to_rho(r, k=k)
+        torque = np.sin(3 * rho) * np.exp(-0.3 * rho)
+        efficiency = 1.0 - 0.1 * np.abs(np.cos(2 * rho))
+        return rho, torque, efficiency
+
+
+# ============================================================
+# MAIN GUI
+# ============================================================
+
+class DE5DualMorphWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("DE5 Dual-Mode Morph Visualizer (Analytic ↔ Rational)")
+        self.resize(900, 700)
+
+        # model + parameters
+        self.model = DE5HyperbolicGenerator()
+        self.k = 1.0
+        self.alpha = 0.0  # morph ratio: 0 = analytic, 1 = rational
+
+        # GUI layout
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout()
+        central.setLayout(layout)
+
+        # top control panel
+        control_panel = QHBoxLayout()
+
+        self.label_alpha = QLabel("Morph α = 0.00 (Analytic → Rational)")
+        self.slider_alpha = QSlider(QtCore.Qt.Horizontal)
+        self.slider_alpha.setRange(0, 100)
+        self.slider_alpha.setValue(0)
+        self.slider_alpha.valueChanged.connect(self.on_slider_change)
+
+        self.save_button = QPushButton("Export Curves CSV")
+        self.save_button.clicked.connect(self.save_curves)
+
+        control_panel.addWidget(self.label_alpha)
+        control_panel.addWidget(self.slider_alpha)
+        control_panel.addWidget(self.save_button)
+
+        layout.addLayout(control_panel)
+
+        # plotting area
+        self.fig = Figure(figsize=(6, 5))
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(self.canvas)
+
+        self.ax_torque = self.fig.add_subplot(211)
+        self.ax_eff = self.fig.add_subplot(212)
+        self.update_plot()
+
+    def on_slider_change(self):
+        self.alpha = self.slider_alpha.value() / 100.0
+        self.label_alpha.setText(f"Morph α = {self.alpha:.2f} (Analytic → Rational)")
+        self.update_plot()
+
+    def update_plot(self):
+        self.ax_torque.clear()
+        self.ax_eff.clear()
+
+        r = np.linspace(0, 0.9, 400)
+        rho_a, torque_a, eff_a = self.model.compute_curve(r, use_rational=False, k=self.k)
+        rho_r, torque_r, eff_r = self.model.compute_curve(r, use_rational=True, k=self.k)
+
+        # Morph between analytic and rational
+        rho_m = (1 - self.alpha) * rho_a + self.alpha * rho_r
+        torque_m = (1 - self.alpha) * torque_a + self.alpha * torque_r
+        eff_m = (1 - self.alpha) * eff_a + self.alpha * eff_r
+
+        # Plot curves
+        self.ax_torque.plot(rho_a, torque_a, 'b-', label="Analytic")
+        self.ax_torque.plot(rho_r, torque_r, 'g--', label="Rational")
+        self.ax_torque.plot(rho_m, torque_m, color='orange', linewidth=2, label=f"Morph α={self.alpha:.2f}")
+        self.ax_torque.set_ylabel("Torque (normalized)")
+        self.ax_torque.legend()
+        self.ax_torque.grid(True)
+
+        self.ax_eff.plot(rho_a, eff_a, 'b-', label="Analytic Eff.")
+        self.ax_eff.plot(rho_r, eff_r, 'g--', label="Rational Eff.")
+        self.ax_eff.plot(rho_m, eff_m, color='orange', linewidth=2, label=f"Morph α={self.alpha:.2f}")
+        self.ax_eff.set_xlabel("ρ (hyperbolic radius)")
+        self.ax_eff.set_ylabel("Efficiency (normalized)")
+        self.ax_eff.grid(True)
+        self.ax_eff.legend()
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+        self.latest_data = pd.DataFrame({
+            "r": r,
+            "rho_analytic": rho_a,
+            "rho_rational": rho_r,
+            "rho_morph": rho_m,
+            "torque_analytic": torque_a,
+            "torque_rational": torque_r,
+            "torque_morph": torque_m,
+            "eff_analytic": eff_a,
+            "eff_rational": eff_r,
+            "eff_morph": eff_m,
+            "alpha": self.alpha
+        })
+
+    def save_curves(self):
+        if not hasattr(self, 'latest_data'):
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save DE5 Morph Curves", "", "CSV Files (*.csv)")
+        if path:
+            self.latest_data.to_csv(path, index=False)
+            QtWidgets.QMessageBox.information(self, "Export Complete", f"Curves saved to:\n{path}")
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+def main():
+    app = QApplication(sys.argv)
+    win = DE5DualMorphWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### 🧭 How to Use
+
+1. Save as **`de5_gui_dual_morph.py`**
+2. Run:
+
+   ```bash
+   python de5_gui_dual_morph.py
+   ```
+3. You’ll see:
+
+   * **Three overlaid curves** on each plot:
+
+     * Blue = Analytic (transcendental)
+     * Green = Rational (Wildberger)
+     * Orange = Morph (current α blend)
+   * **Slider (Morph α)** to move smoothly between the two geometries
+   * **Export Curves** button saves all 3 sets with the active α
+
+---
