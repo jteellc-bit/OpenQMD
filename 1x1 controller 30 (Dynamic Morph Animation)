@@ -1,0 +1,253 @@
+1x1 controller 30 (Dynamic Morph Animation)
+
+ this “Dynamic Morph Animation” upgrade transforms the DE5 dual-mode visualizer into a **living hyperbolic demo tool**.
+You’ll see the analytic (blue), rational (green), and morph (orange) curves *breathe in real time* as the hyperbolic geometry continuously transitions between transcendental and algebraic modes.
+
+Below is the full, ready-to-run **`de5_gui_dual_morph_anim.py`** — with:
+✅ A **Start/Stop animation** toggle
+✅ Smooth oscillation of morph α between 0↔1
+✅ Adjustable **speed slider**
+✅ Live update of the plotted curves
+
+---
+
+```python
+# ============================================================
+# de5_gui_dual_morph_anim.py
+# DE5 Dual-Mode Morph Visualizer + Dynamic "Breathing" Animation
+# ============================================================
+
+import sys
+import numpy as np
+import pandas as pd
+from PyQt5 import QtCore, QtWidgets
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QSlider, QFileDialog
+)
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+
+# ============================================================
+# DE5 MODEL CLASS
+# ============================================================
+
+class DE5HyperbolicGenerator:
+    def __init__(self):
+        self.k = 1.0
+        self.r_clip = 0.999999
+
+    def _r_to_rho(self, r, k=1.0):
+        r = np.asarray(r, dtype=float)
+        r_clamped = np.clip(r, 1e-12, self.r_clip)
+        return np.arctanh(k * r_clamped) / k
+
+    def _r_to_rho_rational(self, r, k=1.0, quadrance_mode=False):
+        r = np.asarray(r, dtype=float)
+        r_clamped = np.clip(r, 1e-12, self.r_clip)
+        denom = 1.0 - (k ** 2) * (r_clamped ** 2)
+        denom = np.where(denom <= 1e-12, 1e-12, denom)
+        if quadrance_mode:
+            rho = (r_clamped ** 2) / denom
+        else:
+            rho = r_clamped / np.sqrt(denom)
+        return rho
+
+    def compute_curve(self, r, use_rational=False, k=1.0):
+        if use_rational:
+            rho = self._r_to_rho_rational(r, k=k)
+        else:
+            rho = self._r_to_rho(r, k=k)
+        torque = np.sin(3 * rho) * np.exp(-0.3 * rho)
+        efficiency = 1.0 - 0.1 * np.abs(np.cos(2 * rho))
+        return rho, torque, efficiency
+
+
+# ============================================================
+# MAIN GUI
+# ============================================================
+
+class DE5DualMorphAnimWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("DE5 Dual-Mode Morph Visualizer + Dynamic Animation")
+        self.resize(900, 700)
+
+        # model + parameters
+        self.model = DE5HyperbolicGenerator()
+        self.k = 1.0
+        self.alpha = 0.0
+        self.time = 0.0
+        self.anim_running = False
+
+        # GUI layout
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout()
+        central.setLayout(layout)
+
+        # top controls
+        ctrl1 = QHBoxLayout()
+        self.label_alpha = QLabel("Morph α = 0.00 (Analytic → Rational)")
+        self.slider_alpha = QSlider(QtCore.Qt.Horizontal)
+        self.slider_alpha.setRange(0, 100)
+        self.slider_alpha.setValue(0)
+        self.slider_alpha.valueChanged.connect(self.on_slider_change)
+        ctrl1.addWidget(self.label_alpha)
+        ctrl1.addWidget(self.slider_alpha)
+        layout.addLayout(ctrl1)
+
+        # animation controls
+        ctrl2 = QHBoxLayout()
+        self.button_toggle_anim = QPushButton("▶ Start Animation")
+        self.button_toggle_anim.clicked.connect(self.toggle_animation)
+        self.label_speed = QLabel("Speed:")
+        self.slider_speed = QSlider(QtCore.Qt.Horizontal)
+        self.slider_speed.setRange(1, 100)
+        self.slider_speed.setValue(25)
+        ctrl2.addWidget(self.button_toggle_anim)
+        ctrl2.addWidget(self.label_speed)
+        ctrl2.addWidget(self.slider_speed)
+        layout.addLayout(ctrl2)
+
+        # save/export
+        ctrl3 = QHBoxLayout()
+        self.save_button = QPushButton("Export Curves CSV")
+        self.save_button.clicked.connect(self.save_curves)
+        ctrl3.addWidget(self.save_button)
+        layout.addLayout(ctrl3)
+
+        # plotting area
+        self.fig = Figure(figsize=(6, 5))
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(self.canvas)
+        self.ax_torque = self.fig.add_subplot(211)
+        self.ax_eff = self.fig.add_subplot(212)
+
+        # animation timer
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.animate_step)
+        self.update_plot()
+
+    # ----------------------------------------------------------------------
+    # Interaction Handlers
+    # ----------------------------------------------------------------------
+
+    def on_slider_change(self):
+        if not self.anim_running:
+            self.alpha = self.slider_alpha.value() / 100.0
+            self.label_alpha.setText(f"Morph α = {self.alpha:.2f} (Analytic → Rational)")
+            self.update_plot()
+
+    def toggle_animation(self):
+        self.anim_running = not self.anim_running
+        if self.anim_running:
+            self.button_toggle_anim.setText("⏸ Pause Animation")
+            self.timer.start(50)
+        else:
+            self.button_toggle_anim.setText("▶ Start Animation")
+            self.timer.stop()
+
+    def animate_step(self):
+        speed_factor = self.slider_speed.value() / 100.0
+        self.time += 0.05 * speed_factor
+        self.alpha = 0.5 + 0.5 * np.sin(self.time)
+        self.slider_alpha.setValue(int(self.alpha * 100))
+        self.label_alpha.setText(f"Morph α = {self.alpha:.2f} (Auto Breathing Mode)")
+        self.update_plot()
+
+    # ----------------------------------------------------------------------
+    # Core Visualization
+    # ----------------------------------------------------------------------
+
+    def update_plot(self):
+        self.ax_torque.clear()
+        self.ax_eff.clear()
+
+        r = np.linspace(0, 0.9, 400)
+        rho_a, torque_a, eff_a = self.model.compute_curve(r, use_rational=False, k=self.k)
+        rho_r, torque_r, eff_r = self.model.compute_curve(r, use_rational=True, k=self.k)
+
+        rho_m = (1 - self.alpha) * rho_a + self.alpha * rho_r
+        torque_m = (1 - self.alpha) * torque_a + self.alpha * torque_r
+        eff_m = (1 - self.alpha) * eff_a + self.alpha * eff_r
+
+        self.ax_torque.plot(rho_a, torque_a, 'b-', label="Analytic")
+        self.ax_torque.plot(rho_r, torque_r, 'g--', label="Rational")
+        self.ax_torque.plot(rho_m, torque_m, color='orange', linewidth=2, label=f"Morph α={self.alpha:.2f}")
+        self.ax_torque.set_ylabel("Torque (normalized)")
+        self.ax_torque.legend()
+        self.ax_torque.grid(True)
+
+        self.ax_eff.plot(rho_a, eff_a, 'b-', label="Analytic Eff.")
+        self.ax_eff.plot(rho_r, eff_r, 'g--', label="Rational Eff.")
+        self.ax_eff.plot(rho_m, eff_m, color='orange', linewidth=2, label=f"Morph α={self.alpha:.2f}")
+        self.ax_eff.set_xlabel("ρ (hyperbolic radius)")
+        self.ax_eff.set_ylabel("Efficiency (normalized)")
+        self.ax_eff.grid(True)
+        self.ax_eff.legend()
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+        self.latest_data = pd.DataFrame({
+            "r": r,
+            "rho_analytic": rho_a,
+            "rho_rational": rho_r,
+            "rho_morph": rho_m,
+            "torque_analytic": torque_a,
+            "torque_rational": torque_r,
+            "torque_morph": torque_m,
+            "eff_analytic": eff_a,
+            "eff_rational": eff_r,
+            "eff_morph": eff_m,
+            "alpha": self.alpha
+        })
+
+    # ----------------------------------------------------------------------
+    # Export CSV
+    # ----------------------------------------------------------------------
+
+    def save_curves(self):
+        if not hasattr(self, 'latest_data'):
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save DE5 Morph Curves", "", "CSV Files (*.csv)")
+        if path:
+            self.latest_data.to_csv(path, index=False)
+            QtWidgets.QMessageBox.information(self, "Export Complete", f"Curves saved to:\n{path}")
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+def main():
+    app = QApplication(sys.argv)
+    win = DE5DualMorphAnimWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### 🧭 How to Use
+
+1. Save as **`de5_gui_dual_morph_anim.py`**
+2. Run:
+
+   ```bash
+   python de5_gui_dual_morph_anim.py
+   ```
+3. Controls:
+
+   * **Morph α slider** → manual morph between analytic & rational
+   * **Start Animation ▶** → automatic “breathing” mode
+   * **Speed slider** → controls oscillation rate
+   * **Export Curves CSV** → saves all three modes + active morph snapshot
+
+---
