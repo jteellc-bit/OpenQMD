@@ -1,0 +1,126 @@
+1x1 controller 27 (rational-trigonometric (Wildberger-style))
+
+Perfect — let’s go fully **rational-trigonometric (Wildberger-style)** so that
+[
+\rho = H(r)
+]
+uses only **polynomial, rational, and square-root operations**, not any transcendental functions (`log`, `sinh`, `atanh`, etc.).
+
+This makes it algebraically closed under field operations — exactly what Wildberger’s *rational trigonometry* and *universal hyperbolic geometry (UHG)* emphasize.
+
+---
+
+### 🌿 Conceptual Background
+
+In Wildberger’s rational framework, **distances** are replaced by **quadrances**, and **angles** by **spreads**, all computable algebraically:
+
+* Euclidean quadrance: ( Q = (x_2 - x_1)^2 + (y_2 - y_1)^2 )
+* Hyperbolic analog (Cayley–Klein model):
+  [
+  Q_h = \frac{r^2}{1 - k^2 r^2}
+  ]
+  where ( k ) controls curvature (analogous to inverse radius of curvature).
+
+This replaces ( \rho = \text{atanh}(k r) ) (non-algebraic) with
+[
+\rho_{\text{rat}} = \frac{r}{\sqrt{1 - k^2 r^2}}
+]
+or, if you prefer the *quadrance* form (avoiding even square roots):
+[
+Q_\rho = \frac{r^2}{1 - k^2 r^2}
+]
+
+Both of these are **purely rational-algebraic** (involve only +, −, ×, ÷, √).
+If you restrict to the quadrance form, even √ can be avoided by using symbolic algebra (since all quantities appear squared).
+
+---
+
+### ✅ Drop-in replacement version
+
+You can drop this `_r_to_rho_rational` into your `DE5HyperbolicGenerator` class — or just replace the existing `_r_to_rho` function entirely if you now prefer only algebraic operations.
+
+```python
+import numpy as np
+
+def _r_to_rho_rational(self, r, model='rational', k=1.0, quadrance_mode=False):
+    """
+    Wildberger-style rational-only hyperbolic radius.
+
+    r : normalized Euclidean radius (0..1)
+    model : 'rational' (default)
+    k : curvature constant (0 <= k <= 1 typically)
+    quadrance_mode : if True, return hyperbolic *quadrance* Q_rho = r^2 / (1 - k^2 r^2)
+                     else return algebraic 'radius' rho = r / sqrt(1 - k^2 r^2)
+
+    This form is algebraically exact in rational trigonometry:
+        Q_hyper = r^2 / (1 - k^2 r^2)
+        rho_hyper = sqrt(Q_hyper)
+    """
+
+    r = np.asarray(r, dtype=float)
+    r_clamped = np.minimum(np.maximum(r, 1e-12), self.r_clip)
+
+    denom = 1.0 - (k ** 2) * (r_clamped ** 2)
+    denom = np.where(denom <= 1e-12, 1e-12, denom)  # prevent division by zero
+
+    if quadrance_mode:
+        # Purely rational quadrance (no sqrt)
+        rho = (r_clamped ** 2) / denom
+    else:
+        # Algebraic (includes sqrt but no transcendental)
+        rho = r_clamped / np.sqrt(denom)
+
+    return rho
+```
+
+Then in your main `de5_velocity_hyper()` method, simply replace the line:
+
+```python
+rho = self._r_to_rho(r, model=transform, k=k)
+```
+
+with:
+
+```python
+rho = self._r_to_rho_rational(r, model='rational', k=k, quadrance_mode=False)
+```
+
+If you want to go fully symbolic / exact-arithmetic, use:
+
+```python
+rho = self._r_to_rho_rational(r, model='rational', k=k, quadrance_mode=True)
+```
+
+and keep all dependent computations in terms of `rho^2` only.
+
+---
+
+### 🧩 Interpretation
+
+| Property                        | Transcendental (Poincaré) | Rational UHG (this version)    |
+| ------------------------------- | ------------------------- | ------------------------------ |
+| Formula                         | ρ = atanh(kr)             | ρ = r / √(1−k²r²)              |
+| Domain                          | r ∈ [0,1/k)               | r ∈ [0,1/k)                    |
+| Field ops                       | requires log / tanh       | only algebraic (+, −, ×, ÷, √) |
+| Compatible with DE5 fractal law | ✅                         | ✅                              |
+| UHG consistency (Wildberger)    | ❌ (analytic)              | ✅ (rational)                   |
+| Symbolic expansion friendly     | Difficult                 | Very easy                      |
+
+---
+
+### 🔧 Optional: hybrid mode
+
+If you want both available, you can keep both definitions and add a switch:
+
+```python
+def _r_to_rho(self, r, model='poincare', k=1.0, rational=False, quadrance_mode=False):
+    if rational:
+        return self._r_to_rho_rational(r, model='rational', k=k, quadrance_mode=quadrance_mode)
+    # otherwise default to analytic form
+    ...
+```
+
+Then you can control everything in your GUI by toggling a checkbox like
+**“Use Rational UHG Mode”** — and your live DE5 curve visualizer will immediately show how the hyperbolic metric shifts under algebraic vs. transcendental geometry.
+
+---
