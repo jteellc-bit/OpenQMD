@@ -1,0 +1,287 @@
+1x1 controller 26 ( RT - UHG-style hyperbolic correction)
+
+let’s embed an RT / UHG-style hyperbolic correction into the DE5 curve generator so the GUI will produce curves that more closely follow the “green” hyperbolic geometry intuition (Wildberger-style algebraic transforms) instead of plain Euclidean powers.
+
+Below is a self-contained, copy-pasteable Python class you can drop into your GUI (replace the previous `DE5CurveGenerator`). It implements:
+
+* a small family of hyperbolic transforms (Poincaré disk and Cayley–Klein / “Cayley” style),
+* safe numerical handling near r → 1,
+* substitution of Euclidean r^2 / r^4 terms by hyperbolic distances ρ^2 / ρ^4,
+* a tunable “green metric” correction factor (algebraic, no transcendental dependencies required if you prefer),
+* optional choice of transform (poincare, atanh-linearized, sinh-based),
+* an example demo routine at the bottom showing usage.
+
+The implementation is deliberately modular so you can swap in your own algebraic RT/UHG transform later (if you want to go fully symbolic / rational-trigonometry). The defaults use a conservative Poincaré-disk transform (ρ = 2 * atanh(r_norm)) which matches the usual hyperbolic radial mapping and is numerically robust when r_norm < 0.999; the code clamps r safely.
+
+---
+
+### What the code does conceptually (plain text):
+
+1. Normalize radius R to unit domain r in (0, 1).
+2. Compute a hyperbolic radius rho = H(r) using the chosen model.
+3. Replace Euclidean terms r^2, r^4, ln(r), etc., with rho^2, rho^4, log_rho (or their algebraic/hyperbolic equivalents).
+4. Introduce a metric-correction multiplier G(rho) = 1 / (1 + alpha * rho^beta) (tunable) to model Green hyperbolic attenuation / amplification.
+5. Evaluate velocity, then derive torque and efficiency as before.
+
+---
+
+### Drop-in code (replace `DE5CurveGenerator`)
+
+```python
+import numpy as np
+
+class DE5HyperbolicGenerator:
+    """
+    DE5 curve generator with RT/UHG-style hyperbolic metric correction ("green" metric).
+    Produces radius (mm), torque (arbitrary units), and efficiency arrays.
+
+    Key ideas:
+      - normalize R -> r in (0,1) using R_ref (user-supplied or inferred)
+      - compute hyperbolic radius rho = H(r) with selectable model
+      - use rho in place of r in fractal / polynomial terms to reflect hyperbolic geometry
+      - apply green-metric correction factor G(rho) = 1 / (1 + alpha * rho**beta)
+      - provide safe numerics near r -> 1 (clamp r_max)
+    """
+
+    def __init__(self, n_points=300, r_ref=None, r_clip=0.9999):
+        self.n_points = int(n_points)
+        self.r_ref = r_ref  # if None, will be set per-row from data (max R)
+        self.r_clip = float(r_clip)
+
+    # -----------------------------
+    # Hyperbolic transform helpers
+    # -----------------------------
+    def _r_to_rho(self, r, model='poincare', k=1.0):
+        """
+        Map unit-radius r in (0,1) to hyperbolic radius rho.
+        Supported models:
+          - 'poincare': rho = 2 * atanh(k * r)  (Poincare disk -> hyperbolic distance)
+          - 'sinh':     rho = asinh(k * r)       (sinh-based)
+          - 'atanh_lin': rho = k * atanh(r)      (less aggressive)
+          - 'linear':   rho = k * r              (fallback linear)
+        k is a scaling constant to control curvature intensity.
+        """
+        r = np.asarray(r, dtype=float)
+        # clamp to avoid numeric atanh issues
+        r_clamped = np.minimum(np.maximum(r, 1e-12), self.r_clip)
+        if model == 'poincare':
+            # rho = 2 * atanh(k*r)
+            # ensure k*r < 1
+            kr = np.minimum(k * r_clamped, 0.999999)
+            rho = 2.0 * 0.5 * np.log((1.0 + kr) / (1.0 - kr))  # atanh = 0.5*ln((1+x)/(1-x))
+            # simplified: rho = np.log((1+kr)/(1-kr))
+            return rho
+        elif model == 'sinh':
+            # asinh(k*r)
+            return np.arcsinh(k * r_clamped)
+        elif model == 'atanh_lin':
+            kr = np.minimum(k * r_clamped, 0.999999)
+            return k * 0.5 * np.log((1.0 + kr) / (1.0 - kr))
+        else:
+            # linear fallback
+            return k * r_clamped
+
+    def _green_metric(self, rho, alpha=0.1, beta=1.0, offset=0.0):
+        """
+        Algebraic 'green' correction factor to multiply the base field.
+        Default: G = 1 / (1 + alpha * rho**beta) + offset
+        alpha ~ curvature coupling strength (>=0)
+        beta  ~ nonlinearity (>=0)
+        offset to allow small additive shift if needed.
+        """
+        # keep numerics stable
+        denom = 1.0 + np.abs(alpha) * np.power(rho, np.abs(beta))
+        return (1.0 / denom) + offset
+
+    # -----------------------------
+    # Core DE5 hyperbolic velocity
+    # -----------------------------
+    def de5_velocity_hyper(self, R, params, model_opts=None):
+        """
+        R: 1D array of radii (same units as R_ref)
+        params: dict with DE5-like parameters, expected keys:
+           a, b, gamma, mscale, (mode parameters A_n,R0_n,sigma_n,lambda_n,phi_n...), C, D
+        model_opts: dict controlling hyperbolic transform & metric:
+           { 'transform': 'poincare', 'k':1.0, 'alpha':0.1, 'beta':1.0, 'offset':0.0, 'use_rho_in_modes': True }
+        """
+        if model_opts is None:
+            model_opts = {}
+        transform = model_opts.get('transform', 'poincare')
+        k = float(model_opts.get('k', 1.0))
+        alpha = float(model_opts.get('alpha', 0.1))
+        beta = float(model_opts.get('beta', 1.0))
+        offset = float(model_opts.get('offset', 0.0))
+        use_rho_in_modes = bool(model_opts.get('use_rho_in_modes', True))
+
+        R = np.asarray(R, dtype=float)
+        # set R_ref and normalize r in (0,1)
+        if self.r_ref is None:
+            Rref = np.max(R) if np.max(R) > 0 else 1.0
+        else:
+            Rref = float(self.r_ref)
+
+        r = np.clip(R / float(Rref), 1e-12, self.r_clip)  # normalized radius
+        rho = self._r_to_rho(r, model=transform, k=k)
+
+        # fractal exponent uses rho (UHG-corrected radial measure)
+        a = float(params.get('a', 0.0))
+        b = float(params.get('b', 1.0))
+        gamma = float(params.get('gamma', 0.0))
+        mscale = float(params.get('mscale', 1.0))
+
+        # safe power: use rho for the fractal scale to embed hyperbolic scaling
+        rho_safe = np.where(rho <= 0, 1e-12, rho)
+        fractal_scale = np.power(rho_safe, gamma)
+
+        V_bar = np.asarray(params.get('V_bar', np.ones_like(R)), dtype=float)
+        baseline = mscale * V_bar * fractal_scale
+        V = a + b * baseline
+
+        # apply green metric factor
+        G = self._green_metric(rho, alpha=alpha, beta=beta, offset=offset)
+        V *= G
+
+        # Oscillatory modal terms (if present)
+        modes = params.get('modes', [])  # list of dicts: [{'A':..., 'R0':..., 'sigma':..., 'lambda':..., 'phi':...}, ...]
+        for mode in modes:
+            A = float(mode.get('A', 0.0))
+            R0 = float(mode.get('R0', 0.0))
+            sigma = float(mode.get('sigma', 1.0))
+            lam = float(mode.get('lambda', 1.0))
+            phi = float(mode.get('phi', 0.0))
+
+            # Gaussian envelope still centered in Euclidean R (you may choose to center in rho if desired)
+            if use_rho_in_modes:
+                # map R0 to normalized r0 and rho0
+                r0 = np.clip(R0 / float(Rref), 1e-12, self.r_clip)
+                rho0 = self._r_to_rho(r0, model=transform, k=k)
+                # convert sigma (if provided in R units) roughly to rho units using local derivative approx:
+                # safest: use Euclidean Gaussian but evaluate phase using rho
+                Genv = np.exp(- (R - R0)**2 / (2.0 * sigma**2))
+                Theta = 2.0 * np.pi * rho / lam + phi
+            else:
+                Genv = np.exp(- (R - R0)**2 / (2.0 * sigma**2))
+                Theta = 2.0 * np.pi * r / lam + phi
+
+            V += A * Genv * np.sin(Theta)
+
+        # optional corrections
+        C = float(params.get('C', 0.0))
+        D = float(params.get('D', 0.0))
+        chaos_kernel = np.asarray(params.get('chaos_kernel', np.zeros_like(R)))
+        spin_kernel = np.asarray(params.get('spin_kernel', np.zeros_like(R)))
+        V += C * chaos_kernel + D * spin_kernel
+
+        # ensure valid numeric range
+        V = np.nan_to_num(V, nan=0.0, posinf=np.max(V)+1.0, neginf=0.0)
+        # finalize — velocities must be non-negative
+        V = np.abs(V)
+        return V, {'rho': rho, 'G': G, 'r': r}
+
+    # -----------------------------
+    # Convenience: compute curve and derived metrics
+    # -----------------------------
+    def compute_curve_from_row(self, R_raw, row_dict, model_opts=None):
+        """
+        R_raw: physical radii array in same units as row_dict R_ref (or None to use default)
+        row_dict: dict or pandas.Series containing parameter names for a single DE5 row
+        model_opts: hyperbolic options (see de5_velocity_hyper)
+        Returns: dict with x (R), v, torque, eff, metadata
+        """
+        if R_raw is None:
+            # create normalized radius vector (0..R_ref)
+            Rref = float(row_dict.get('R_ref', self.r_ref if self.r_ref is not None else 1.0))
+            R = np.linspace(0.001 * Rref, Rref, self.n_points)
+        else:
+            R = np.asarray(R_raw, dtype=float)
+
+        # collect params
+        params = {}
+        params['a'] = float(row_dict.get('a', 0.0))
+        params['b'] = float(row_dict.get('b', 1.0))
+        params['gamma'] = float(row_dict.get('gamma', 0.0))
+        params['mscale'] = float(row_dict.get('mscale', 1.0))
+        params['V_bar'] = np.asarray(row_dict.get('V_bar', 1.0 * np.ones_like(R)))
+        # modes: expect a small JSON-like or flattened set in row_dict; here we support a 'modes' key
+        params['modes'] = row_dict.get('modes', [])
+
+        params['C'] = float(row_dict.get('C', 0.0))
+        params['D'] = float(row_dict.get('D', 0.0))
+
+        # compute hyperbolic-corrected velocity
+        V, meta = self.de5_velocity_hyper(R, params, model_opts=model_opts)
+
+        # derive torque ~ r * dV/dr (use hyperbolic rho as argument if desired)
+        dr = np.gradient(R)
+        dVdR = np.gradient(V, dr)
+        torque = (R / (R.max() if R.max() != 0 else 1.0)) * dVdR  # normalized torque proxy
+
+        # efficiency proxy: normalized (v/v_max)^2 scaled to [0,1]
+        eff = np.clip((V / (np.max(V) if np.max(V) > 0 else 1.0))**2, 0.0, 1.0)
+
+        return {
+            'x': R,
+            'v': V,
+            'torque': torque,
+            'eff': eff,
+            'meta': meta
+        }
+
+# -----------------------------
+# Quick demo / smoke-test
+# -----------------------------
+if __name__ == "__main__":
+    gen = DE5HyperbolicGenerator(n_points=300, r_ref=20.0)
+    R = np.linspace(0.5, 20.0, 300)
+
+    # sample row / params
+    row = {
+        'a': 0.5,
+        'b': 1.02,
+        'gamma': 0.15,
+        'mscale': 1.0,
+        'V_bar': 100.0 * (1 - np.exp(-R/5.0)),  # synthetic baryonic baseline
+        'modes': [
+            {'A': 40.0, 'R0': 3.5, 'sigma': 1.0, 'lambda': 8.0, 'phi': 0.0},
+            {'A': 25.0, 'R0': 8.0, 'sigma': 2.0, 'lambda': 10.0, 'phi': 1.6}
+        ],
+        'C': 0.02, 'D': 0.01
+    }
+    model_opts = {'transform': 'poincare', 'k': 0.9, 'alpha': 0.08, 'beta': 1.2, 'offset': 0.0, 'use_rho_in_modes': True}
+    out = gen.compute_curve_from_row(R, row, model_opts=model_opts)
+
+    # simple assertion checks
+    assert 'v' in out and 'torque' in out and 'eff' in out
+    print("Demo produced v (len):", len(out['v']), " vmax:", np.max(out['v']))
+```
+
+---
+
+## Notes, tuning guidance and caveats
+
+1. **Why this is algebraic-friendly**
+   The code uses atanh/log combinations for the Poincaré transform, but the structure is explicitly modular: you can replace `_r_to_rho` with any Wildberger-style algebraic transform (rational operations) if you prefer. That allows moving away from transcendental calls later and keeping purely algebraic approximations.
+
+2. **Parameters to tune**
+
+   * `transform` chooses curvature mapping. `'poincare'` is usually sensible for disk-like normalization. `'sinh'` is smoother for large-r behaviour.
+   * `k` controls curvature strength (k ≲ 1 recommended).
+   * `alpha` controls how strongly the green metric modulates amplitudes (start 0.05–0.2).
+   * `beta` adjusts nonlinearity (1.0 = linear, >1 sharper decay).
+   * `use_rho_in_modes`: set True to phase modes in hyperbolic coordinates (recommended).
+
+3. **Numerics**
+
+   * Keep `r_clip` < 1 (0.9999 default). If your R values might exceed the intended reference, normalize with a realistic R_ref.
+   * atanh/log can overflow if arg → 1; the clamp prevents that.
+
+4. **Interpretation**
+
+   * Expect the hyperbolic correction to concentrate field intensity toward small r or spread it depending on `k`. This will shift torque/efficiency curves in ways consistent with the DE5 UHG intuition: geometry changes the effective radial scaling.
+   * Use `meta['rho']` and `meta['G']` returned by `de5_velocity_hyper` when debugging or plotting the effect of UHG.
+
+5. **Next steps**
+
+   * If you want the fully algebraic / rational-trigonometry version (no logs/atanh at all), tell me which algebraic transform you want implemented (Wildberger proposes purely rational cross-ratio transforms) and I’ll provide a rational-only `_r_to_rho` variant that uses cross-ratios and rational polynomials instead of atanh/log.
+
+---
