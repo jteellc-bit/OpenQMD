@@ -1,0 +1,312 @@
+QMD for BLDC motor 5 (ready-to-paste, Colab - pipeline-friendly Python module)
+
+below is a ready-to-paste, Colab / pipeline-friendly Python module that replaces every cos(θ) / trig dependency with an algebraic Euclidean Rational Trigonometry (RT) squared-torque proxy and supplies a full set of utilities you can drop straight into your simulation:
+    • helper algebraic functions (quadrance, dot, squared-torque proxy, signed proxy)
+    • signed torque proxy (recovering sign from dot-product when you need direction)
+    • a parity test (proxy vs cos) so you can quickly validate across your envelope
+    • an active hill-climb / probe routine that uses ±Δφ probes and chooses the best algebraically (non-trig)
+    • a phase-jitter stress test that generates torque & efficiency maps (same API you used before)
+    • integration notes / how to apply the patch in your existing code (exact replacement patterns)
+    • numerical safeguards and fixed-point / MCU notes
+I did not run anything here (I’m delivering the code to run in your Colab or pipeline). Paste into Colab and run the demo cells to validate parity and re-run hill-climb / stress tests in your environment.
+
+How to use
+    1. Paste entire code block below into a new Colab cell (or a file de5_rt_proxy.py in your repo).
+    2. Run the parity test cell to verify algebraic proxy ≈ trig-based torque across angles.
+    3. Replace calls in your simulation:
+        ◦ anywhere you use k_t * I * np.cos(phase_error) replace with signed_torque_proxy(k_t,I,u,v) or if you use setpoints built from scalar phases, use scalar_signed_torque_from_phase(k_t,I,phi_u,phi_v) (both provided).
+        ◦ to optimize without sqrt, use squared_torque_proxy(k_t,I,u,v) as objective for hill-climb or optimizer.
+    4. Run your hill-climb / stress-test (example functions included) and save results as your previous CSVs.
+
+Colab-ready code (complete)
+# de5_rt_proxy.py
+# Colab-ready: Algebraic RT proxy replacing cos(theta) dependencies
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Tuple, Callable, Dict
+
+# -------------------------
+# Basic algebraic helpers
+# -------------------------
+def quadrance(u: np.ndarray) -> float:
+    """Euclidean quadrance (squared length). Works with 1D arrays of length 2 or Nx2 arrays."""
+    u = np.asarray(u)
+    if u.ndim == 1:
+        return float(u[0]*u[0] + u[1]*u[1])
+    else:
+        return np.sum(u**2, axis=1)
+
+def dot_euclid(u: np.ndarray, v: np.ndarray) -> float:
+    """Euclidean dot product (supports vectors or elementwise Nx2 arrays)."""
+    u = np.asarray(u); v = np.asarray(v)
+    if u.ndim == 1:
+        return float(u[0]*v[0] + u[1]*v[1])
+    else:
+        return np.sum(u * v, axis=1)
+
+# -------------------------
+# Torque proxy functions
+# -------------------------
+def squared_torque_proxy(k_t: float, I: float, u: np.ndarray, v: np.ndarray, eps: float=1e-18) -> float:
+    """
+    Algebraic proxy proportional to torque^2:
+      proxy = (k_t^2 * I^2) * (D^2) / (Qu * Qv)
+    where D = dot(u,v), Qu = quadrance(u), Qv = quadrance(v).
+    Returns scalar or array matching input shapes.
+    """
+    u = np.asarray(u); v = np.asarray(v)
+    D = dot_euclid(u, v)
+    Qu = quadrance(u)
+    Qv = quadrance(v)
+    denom = (Qu * Qv) if np.isscalar(Qu) else (Qu * Qv)
+    # Guard against zero denom
+    denom = np.where(np.abs(denom) < eps, eps, denom)
+    return (k_t*k_t) * (I*I) * (D*D) / denom
+
+def signed_torque_proxy(k_t: float, I: float, u: np.ndarray, v: np.ndarray, eps: float=1e-18) -> float:
+    """
+    Algebraic signed torque proxy equivalent to k_t*I*cos(theta) but computed algebraically.
+    We get sign from D and magnitude from sqrt(proxy).
+    Note: This computes one sqrt per call; if performance is critical, operate on squared values and track sign separately.
+    """
+    u = np.asarray(u); v = np.asarray(v)
+    D = dot_euclid(u, v)
+    Qu = quadrance(u)
+    Qv = quadrance(v)
+    denom = (Qu * Qv) if np.isscalar(Qu) else (Qu * Qv)
+    denom = np.where(np.abs(denom) < eps, eps, denom)
+    sq_proxy = (k_t*k_t) * (I*I) * (D*D) / denom
+    mag = np.sqrt(np.maximum(sq_proxy, 0.0))
+    sign = np.sign(D)
+    return sign * mag
+
+# Convenience if you have phases (scalars)
+def scalar_signed_torque_from_phase(k_t: float, I: float, phi_u: float, phi_v: float) -> float:
+    """If your model uses scalar angles for the two fields, convert to 2D vectors then compute signed proxy."""
+    u = np.array([np.cos(phi_u), np.sin(phi_u)])
+    v = np.array([np.cos(phi_v), np.sin(phi_v)])
+    return signed_torque_proxy(k_t, I, u, v)
+
+def scalar_squared_torque_from_phase(k_t: float, I: float, phi_u: float, phi_v: float) -> float:
+    u = np.array([np.cos(phi_u), np.sin(phi_u)])
+    v = np.array([np.cos(phi_v), np.sin(phi_v)])
+    return squared_torque_proxy(k_t, I, u, v)
+
+# -------------------------
+# Parity / sanity tests
+# -------------------------
+def parity_test_angles(k_t=0.12, I=10.0, n=361):
+    """Compare algebraic proxy vs cos-based torque across angles and plot parity and error."""
+    thetas = np.linspace(0, 2*np.pi, n)
+    u = np.array([1.0, 0.0])
+    cos_torque = (k_t * I * np.cos(thetas))  # vectorized
+    proxy_sq = []
+    proxy_signed = []
+    for th in thetas:
+        v = np.array([np.cos(th), np.sin(th)])
+        proxy_sq.append(squared_torque_proxy(k_t, I, u, v))
+        proxy_signed.append(signed_torque_proxy(k_t, I, u, v))
+    proxy_sq = np.array(proxy_sq)
+    proxy_signed = np.array(proxy_signed)
+
+    # cos-based squared
+    cos_sq = cos_torque**2
+
+    # Parity plot: sqrt(proxy_sq) vs abs(cos_torque)
+    plt.figure(figsize=(12,4))
+    plt.subplot(1,3,1)
+    plt.plot(thetas, np.sqrt(proxy_sq), label='|proxy|')
+    plt.plot(thetas, np.abs(cos_torque), '--', label='|cos-based|')
+    plt.title('Magnitude parity')
+    plt.legend()
+
+    plt.subplot(1,3,2)
+    plt.plot(thetas, proxy_signed, label='proxy signed')
+    plt.plot(thetas, cos_torque, '--', label='cos-based signed')
+    plt.title('Signed torque parity')
+    plt.legend()
+
+    plt.subplot(1,3,3)
+    rel_err = (np.sqrt(proxy_sq) - np.abs(cos_torque)) / (np.abs(cos_torque) + 1e-12)
+    plt.plot(thetas, rel_err)
+    plt.title('Relative error (mag)')
+    plt.xlabel('theta [rad]')
+    plt.tight_layout()
+    return thetas, proxy_signed, cos_torque, rel_err
+
+# -------------------------
+# Active probe hill-climb (non-blocking style ready to embed)
+# -------------------------
+def active_probe_step(current_phase_ref: float,
+                      probe_delta: float,
+                      measure_fn: Callable[[float], float],
+                      settle_ms: float = 10.0) -> Tuple[float, Dict]:
+    """
+    Single active probe step:
+      - apply +probe_delta for N ms, measure mean torque via measure_fn(phase)
+      - apply -probe_delta for N ms, measure mean torque
+      - choose the phase offset (ref + sign*probe_delta) that gave higher measured torque
+    measure_fn(phase) should be a function that applies the commanded phase offset and returns an instantaneous or short-averaged torque reading (non-blocking).
+    Returns (new_ref_phase, diagnostics)
+    diagnostics contains measured values for both probes.
+    """
+    # NOTE: this wrapper assumes measure_fn handles timing/averaging non-blocking or has internal buffering.
+    phase_p = current_phase_ref + probe_delta
+    phase_m = current_phase_ref - probe_delta
+
+    T_p = measure_fn(phase_p)
+    T_m = measure_fn(phase_m)
+
+    # If equal within tolerance, keep center (can choose hysteresis)
+    if T_p > T_m:
+        chosen = phase_p
+    elif T_m > T_p:
+        chosen = phase_m
+    else:
+        chosen = current_phase_ref
+
+    diags = {'T_plus': T_p, 'T_minus': T_m, 'chosen': chosen}
+    return chosen, diags
+
+# -------------------------
+# Basic stress test harness
+# -------------------------
+def phase_jitter_stress_test(measure_fn: Callable[[float, float], Tuple[float,float]],
+                             phase_grid: np.ndarray,
+                             jitter_grid: np.ndarray,
+                             trials: int = 8):
+    """
+    measure_fn(phase_offset, jitter_amp) -> (torque_mean, efficiency_mean)  [user supplies]
+    Returns maps (torque_map, eff_map) shaped (len(jitter_grid), len(phase_grid))
+    """
+    torque_map = np.zeros((len(jitter_grid), len(phase_grid)))
+    eff_map = np.zeros_like(torque_map)
+
+    for i, ja in enumerate(jitter_grid):
+        for j, ph in enumerate(phase_grid):
+            tt = []
+            ee = []
+            for t in range(trials):
+                torque, eff = measure_fn(ph, ja)
+                tt.append(torque); ee.append(eff)
+            torque_map[i, j] = float(np.mean(tt))
+            eff_map[i, j] = float(np.mean(ee))
+    return torque_map, eff_map
+
+# -------------------------
+# Example mock measure functions for demo / unit tests
+# -------------------------
+def mock_measure_from_phase_and_jitter(phase_offset: float, jitter_amp: float,
+                                       k_t=0.12, I_base=10.0, noise=0.01):
+    """
+    Simulate instantaneous torque and efficiency given phase offset and jitter amplitude.
+    This mock uses a signed proxy with small noise and reduces torque magnitude as jitter increases.
+    """
+    # jitter simulated as random phase perturbation scaled by jitter_amp
+    jitter = np.random.uniform(-jitter_amp, jitter_amp)
+    phi = phase_offset + jitter
+    torque = scalar_signed_torque_from_phase(k_t, I_base, 0.0, phi)
+    # Efficiency model: baseline 0.95, improved at alignment, reduced with jitter
+    eff = 0.95 + 0.02 * np.cos(phase_offset) - 0.005 * (jitter_amp**1.2) + np.random.normal(0, noise*0.1)
+    return float(torque), float(eff)
+
+# -------------------------
+# Utility: map visualization
+# -------------------------
+def plot_maps(phase_grid, jitter_grid, torque_map, eff_map, cmap='viridis'):
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1)
+    plt.imshow(torque_map, origin='lower', aspect='auto', extent=[phase_grid.min(), phase_grid.max(), jitter_grid.min(), jitter_grid.max()])
+    plt.colorbar(label='Torque mean')
+    plt.xlabel('Phase offset [rad]')
+    plt.ylabel('Jitter amp [rad]')
+    plt.title('Torque map')
+
+    plt.subplot(1,2,2)
+    plt.imshow(eff_map, origin='lower', aspect='auto', extent=[phase_grid.min(), phase_grid.max(), jitter_grid.min(), jitter_grid.max()])
+    plt.colorbar(label='Efficiency mean')
+    plt.xlabel('Phase offset [rad]')
+    plt.title('Efficiency map')
+    plt.tight_layout()
+
+# -------------------------
+# Integration helper notes
+# -------------------------
+INTEGRATION_NOTES = """
+INTEGRATION (how to replace cos(theta) in your pipeline):
+ - If your code computes torque as: T = k_t * I * np.cos(phase_error),
+   replace with           : T = scalar_signed_torque_from_phase(k_t, I, phi_stat, phi_rot)
+   (if you already work with phasors I_cos/I_sin from ADC, build u=(Icos,Isin) and v likewise and call signed_torque_proxy)
+
+ - If you use cost/objective without sign (e.g., hill-climb), use squared_torque_proxy to avoid sqrt and sign.
+   Example:
+       obj = squared_torque_proxy(k_t, I, u, v)   # maximize obj
+
+ - When you need sign: use np.sign(dot_euclid(u,v)) or signed_torque_proxy.
+
+ - Safety:
+   * Protect against Qu*Qv ~ 0: functions contain small eps guard.
+   * For MCU fixed-point: scale values by a common factor to stay in integer range or use 64-bit intermediate.
+
+ - Notes on hill-climb/probing:
+   * Use active_probe_step wrapper with your real non-blocking measure function (which should average readings for N ms)
+   * Probe delta should be small (e.g., a few degrees) and adapted to your rotor dynamics.
+
+ - Numerical ranges:
+   * squared_torque_proxy returns values scaled by k_t^2 I^2; if k_t and I are large, values can be big; scale down for optimizers as needed.
+"""
+
+# -------------------------
+# Example quick demo (parity + stress test)
+# -------------------------
+if __name__ == "__main__":
+    # Parity check
+    thetas, proxy_signed, cos_torque, rel_err = parity_test_angles()
+    print("Max relative error (mag):", np.nanmax(np.abs(rel_err)))
+
+    # Run a small stress test demo
+    phase_grid = np.linspace(0, 2*np.pi, 61)
+    jitter_grid = np.linspace(0.0, 0.5, 25)  # radians jitter
+    torque_map, eff_map = phase_jitter_stress_test(lambda ph, ja: mock_measure_from_phase_and_jitter(ph, ja, k_t=0.12, I_base=10.0), phase_grid, jitter_grid, trials=6)
+    plot_maps(phase_grid, jitter_grid, torque_map, eff_map)
+    plt.show()
+
+Integration checklist — exact replacement patterns
+If your existing code contains lines like:
+phase_error = phi_stat - phi_rot  # in radians
+T = k_t * I * np.cos(phase_error)
+Replace with:
+# option A: if you have scalar phases
+T = scalar_signed_torque_from_phase(k_t, I, phi_stat, phi_rot)
+
+# option B: if you have phasor components already (recommended)
+u = np.array([I_stat_cos, I_stat_sin])
+v = np.array([I_rot_cos, I_rot_sin])
+T = signed_torque_proxy(k_t, 1.0, u, v) * (I_scale)   # careful: scale consistent with phasor magnitudes
+If you use an objective inside an optimizer or a hill-climb that does not need signed torque:
+obj = squared_torque_proxy(k_t, I, u, v)   # maximize this
+
+MCU / fixed-point and performance notes
+    • The inner-loop can avoid any sqrt if you operate on squared proxies — that’s ideal on MCU. Only compute sqrt() when you need signed amplitude to command a current magnitude (one sqrt per control frame is fine).
+    • Keep the eps guard to avoid divide-by-zero.
+    • If you use phasor ADCs that provide in-phase/quadrature samples (Icos, Isin), feed them directly as u/v.
+    • For fixed-point, scale all floats by e.g. 2^20, compute using 64-bit integers for intermediates, then shift back. Use saturation clamps.
+
+Suggested immediate tests to run in Colab (paste into a cell after loading module)
+# 1) parity + plot (sanity)
+from de5_rt_proxy import parity_test_angles, phase_jitter_stress_test, plot_maps, mock_measure_from_phase_and_jitter
+thetas, proxy_signed, cos_torque, rel_err = parity_test_angles()
+print("Max relative mag error:", np.max(np.abs(rel_err)))
+
+# 2) re-run your hill-climb probe using active_probe_step with your real non-blocking measure. For demo:
+from de5_rt_proxy import phase_jitter_stress_test
+phase_grid = np.linspace(0, 2*np.pi, 61)
+jitter_grid = np.linspace(0.0, 0.5, 21)
+torque_map, eff_map = phase_jitter_stress_test(lambda ph, ja: mock_measure_from_phase_and_jitter(ph, ja, k_t=0.12, I_base=10.0), phase_grid, jitter_grid, trials=8)
+plot_maps(phase_grid, jitter_grid, torque_map, eff_map)
+
+Discussion & caveats (brief)
+    • Proxy vs exact cos: mathematically the proxy is equivalent to cos^2 and recovers sign via D. In typical phasor scenarios the parity is excellent. Parity plot will quantify any tiny numerical mismatch from finite numeric rounding.
+    • Hill-climb behavior: switching the objective to squared torque avoids local minima related to sign flips, but you must use sign(D) when commanding polarity.
+    • MCU resource: if you already compute phasor components (Icos/Isin) you save a lot — the algebraic proxy is extremely cheap: a few multiplies and adds + a divide. If you need sign+mag you do one sqrt.
+    • Numerical stability: watch very small Qu or Qv when phasors are nearly zero (e.g., motor off); code has a small eps guard, but you may want stronger gating: if Qu < threshold, treat as zero torque and skip optimization.
