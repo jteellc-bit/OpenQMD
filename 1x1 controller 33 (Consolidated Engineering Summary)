@@ -1,0 +1,140 @@
+1x1 controller 33 (Consolidated Engineering Summary)
+
+ Consolidated Engineering Summary
+1. Stress Test Results: (Phase Offset + Jitter)
+    • Torque & Efficiency Uniformity:
+Both 2HB and 3HB topologies show flat torque and efficiency maps across all tested phase offsets and jitter amplitudes.
+→ Root cause: de5_setpoints_for_step() currently doesn’t dynamically incorporate phase/jitter into current setpoints.
+    • Baseline Comparison:
+        ◦ 2HB ≈ 10.47 Nm / 0.966 efficiency
+        ◦ 3HB ≈ 8.43 Nm / 0.955 efficiency
+→ 2HB is more torque-dense and slightly more efficient, confirming earlier results.
+    • Next Step:
+Integrate dynamic phase/jitter modulation into the DE5 control logic — this will expose resonance, destructive interference, and PWM timing sensitivity in the real drive.
+
+2. Refined Parameter Scaling (Rcoil, Lcoil)
+Metric
+2x_2HB Scaling
+2x_Combined_2HB Scaling
+Interpretation
+ω_mean
+1.41×
+1.43×
+Matches √2 scaling → physically plausible
+T_mean
+2.53×
+3.00×
+Combined coils still best for torque
+eff_mean
+0.993×
+1.004×
+Parallel coils yield higher efficiency
+P_loss_mean
+4.32×
+3.91×
+Combined design mitigates I²R growth
+Conclusion:
+These refined scaling laws (R ∝ 1/L, L ∝ L) produce realistic physical behavior:
+    • Efficiency improves for combined (parallelized) coil designs.
+    • Simply scaled motors show expected thermal stress and loss growth.
+    • The combined 2x design remains the optimal direction for high-power builds.
+
+3. Power Stage and Controller Component Strategy
+⚡ MOSFET Technology:
+Option
+Pros
+Cons
+Recommended Use
+SiC MOSFET
+High voltage, high temp, robust, mature
+Slightly slower, higher gate charge
+Default choice for >600 V bus or heavy current (>100 A per leg)
+GaN FET
+Ultra-fast switching (10–100 MHz), low Qg, minimal reverse recovery → higher PWM frequency and efficiency
+Lower voltage (<650 V typical), costlier, thermally limited
+Use when switching frequency > 100 kHz and current < 100 A; especially for precision motor control or compact PCB drivers
+✅ Recommendation:
+Use GaN MOSFETs as the primary choice if bus voltage ≤ 600 V and thermal load < 100 A/phase.
+Fallback to SiC when cost, voltage, or robustness dominates.
+
+4. DC-Link and Snubber Capacitance
+A. Sizing for Ripple Control
+You can estimate DC-link capacitance ( C_{dc} ) as:
+[
+C_{dc} \ge \frac{I_{pulse} \cdot \Delta t}{\Delta V}
+]
+Where:
+    • ( I_{pulse} ) = worst-case phase current spike (A)
+    • ( \Delta t ) = pulse duration (s)
+    • ( \Delta V ) = acceptable bus voltage ripple (V)
+Typical design targets:
+    • ΔV ≤ 5 % of Vbus
+    • Pulse durations: 0.5–2 ms for motor phase commutation
+    • Add 20–30 % margin for non-ideal ESR/ESL
+B. Snubber / Flyback Network
+Function
+Recommended Part Type
+Notes
+DC-link bulk
+Film capacitors (PP, low-ESR), e.g. KEMET C4AQ, WIMA DC-Link MKP
+High ripple, long life
+Switch-node snubber
+NP0/C0G ceramics (10–100 nF, 600–1 kV) close to MOSFETs
+Absorbs ringing
+Gate decoupling
+Small ceramics (1–10 µF X7R) near driver IC
+Stabilizes gate driver rail
+Transient suppression
+TVS diode or RC-snubber across bridge
+Protects FETs from inductive spikes
+Flyback diodes
+Ultra-fast Si or SiC diodes rated 1.5× Ipeak, 1.5× Vbus
+Parallel with coils if FET intrinsic body diode inadequate
+
+5. 💻 Colab-Ready Capacitor Calculator
+Here’s a compact, runnable tool for quick capacitance and energy budget estimation:
+# Colab: DC-Link and Energy Budget Calculator
+import numpy as np
+
+# User inputs
+I_pulse = 150.0      # A
+pulse_ms = 1.0       # ms
+V_bus = 400.0        # V
+dv_percent = 5.0     # % ripple allowed
+
+# Derived
+dt = pulse_ms / 1000
+dV = V_bus * dv_percent / 100
+
+# Capacitance requirement
+C_req = I_pulse * dt / dV  # Farads
+E_stored = 0.5 * C_req * (V_bus**2)
+E_pulse = I_pulse * V_bus * dt
+
+print(f"Required C ≈ {C_req*1e3:.2f} mF")
+print(f"Stored Energy ≈ {E_stored/1000:.1f} kJ")
+print(f"Pulse Energy ≈ {E_pulse/1000:.1f} kJ")
+print(f"Energy Margin ≈ {E_stored/E_pulse:.2f}×")
+✅ You can modify I_pulse, pulse_ms, and dv_percent to test different cases.
+
+6. Example Cap Bank Selection
+Application
+Target Capacitance
+Candidate Parts
+Notes
+Main DC-Link (400 V, 150 A pulses)
+2–5 mF
+KEMET C4AQE or WIMA MKP4, 450–600 VDC
+Polypropylene film, very low ESR
+Local Decoupling (per half-bridge)
+100–300 µF
+Panasonic EEU-FC, Nichicon UPM, polymer electrolytics
+Low ESR, compact
+Transient Buffer (energy recovery)
+50–100 F
+Maxwell BMOD or Eaton XVM supercaps, 48–96 V stack
+Optional for regen energy smoothing
+
+
+
+
