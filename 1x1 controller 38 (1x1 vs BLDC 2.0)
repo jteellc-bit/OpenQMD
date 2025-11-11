@@ -1,0 +1,162 @@
+1x1 controller 38 (1x1 vs BLDC 2.0)
+
+Below I give (A) clear, digit-by-digit energy / range comparisons for the two use-cases you described (same-speed cruise vs full-throttle sprint), (B) what that implies for real batteries and range, and (C) practical controller / firmware / safety recommendations (what to add to the code) so real riders don’t burn the hardware or the battery when they “just floor it.” I finish with (D) a small, copy-pasteable active-probe pseudocode for the ±Δφ hill-climb/probe test you asked for.
+
+A — Concrete energy math (step-by-step)
+Assumptions (explicit):
+    • Reference mechanical power required at 48 km/h: (P_{\text{mech,48}} = 2.3\ \text{kW}).
+    • Trip: 24 km at 48 km/h → trip time (t_1 = 24/48 = 0.5\ \text{h}).
+    • Cruising efficiencies:
+        ◦ BLDC at cruise: (\eta_{\text{BLDC,cruise}} = 0.80).
+        ◦ 1x1 (DE5) at cruise: (\eta_{\text{DE5,cruise}} = 0.94).
+    • Full-throttle example: speed = 60 km/h (for comparison).
+        ◦ Aerodynamic/mechanical power scales like (v^3) (dominant aerodynamic term).
+        ◦ So (P_{\text{mech,60}} = P_{\text{mech,48}}\times(60/48)^3).
+        ◦ Trip time at 60 km/h: (t_2 = 24/60 = 0.4\ \text{h}).
+    • Full-throttle efficiencies (plausible):
+(\eta_{\text{BLDC,full}} = 0.75,\ \eta_{\text{DE5,full}} = 0.88.)
+Now compute carefully.
+    1. Cruise (48 km/h):
+    • Electrical energy used by BLDC:
+        ◦ (P_{\text{elec,BLDC}} = P_{\text{mech,48}} / \eta_{\text{BLDC,cruise}} = 2.3 / 0.80 = 2.875\ \text{kW}).
+        ◦ Energy for trip: (E_{\text{BLDC}} = 2.875\ \text{kW}\times 0.5\ \text{h} = 1.4375\ \text{kWh}) = 1437.5 Wh.
+    • Electrical energy used by DE5:
+        ◦ (P_{\text{elec,DE5}} = 2.3 / 0.94 \approx 2.4468085106\ \text{kW}).
+        ◦ Energy for trip: (E_{\text{DE5}} = 2.4468085106\times0.5 \approx 1.2234042553\ \text{kWh}) = 1223.40 Wh.
+    • Absolute saving per trip: (1437.50 - 1223.40 = 214.10\ \text{Wh}) (≈ 214 Wh saved).
+    • Relative saving: (214.10 / 1437.50 \approx 0.1490 = \mathbf{14.9%}) less energy used on the trip.
+    2. Full-throttle sprint (60 km/h):
+    • Scale mechanical power: ((60/48)^3 = 1.25^3 = 1.953125).
+        ◦ (P_{\text{mech,60}} = 2.3\times1.953125 = 4.4921875\ \text{kW}.)
+    • BLDC energy:
+        ◦ (P_{\text{elec,BLDC,full}} = 4.4921875 / 0.75 = 5.9895833333\ \text{kW}).
+        ◦ Energy for trip: (E_{\text{BLDC,full}} = 5.9895833333\times0.4 = 2.3958333333\ \text{kWh}) = 2395.83 Wh.
+    • DE5 energy:
+        ◦ (P_{\text{elec,DE5,full}} = 4.4921875 / 0.88 \approx 5.1022625\ \text{kW}).
+        ◦ Energy: (E_{\text{DE5,full}} = 5.1022625\times0.4 \approx 2.040905\ \text{kWh}) = 2040.91 Wh.
+    • Absolute saving: (2395.83 - 2040.91 = 354.92\ \text{Wh}) (≈ 355 Wh saved).
+    • Relative saving: (354.92 / 2395.83 \approx 0.1482 = \mathbf{14.8%}) saved.
+Key numerical takeaway: the DE5 controller/motor in these scenarios saves ~15% of electrical energy both at steady cruise and at higher-speed sprint in our examples — the percentage is similar, but the absolute kWh saved is larger for the sprint (≈355 Wh vs ≈214 Wh) because the sprint drains more energy overall.
+
+B — What that means for batteries and range (practical)
+    • Example battery: 48 V × 10 Ah = 480 Wh.
+        ◦ If the cruise trip needs ~1.22 kWh (DE5) or 1.44 kWh (BLDC), a single 480 Wh pack cannot complete the 24 km trip in either case — you’d need ~3× that pack. (This mismatch is why earlier runs used different battery capacities.)
+    • More useful is relative range gain: saving 214 Wh per trip means:
+        ◦ If you had a 1.5 kWh usable pack, DE5 would let you do (\approx 1.5 / 1.2234 \times 24 = 29.4) km, whereas BLDC would give (\approx 1.5 / 1.4375 \times 24 = 25.0) km — roughly a 17% increase in range on that hypothetical battery. (Numbers scale linearly.)
+    • For riders: the DE5’s higher efficiency mostly translates to either:
+        ◦ longer range for the same battery, or
+        ◦ faster trips for the same energy budget — but faster trips consume more absolute energy (because aero ∝ v³), so range still falls.
+
+C — Practical controller & firmware recommendations (must-haves)
+People WILL floor it. Protect the hardware and batteries proactively. Implement these controls in firmware (MCU side) and GUI:
+    1. Hard limits (safety first)
+        ◦ Bus current limit I_bus_limit (from battery/BMS spec).
+        ◦ Per-coil current clamp I_coil_peak and I_coil_cont.
+        ◦ Thermal limit: T_coil_max, T_core_max. If coil temp estimate > threshold, reduce torque or go to safe mode.
+        ◦ Power limit: P_max = V_bus * I_bus_limit (software enforcement).
+    2. Operating Modes (user-selectable)
+        ◦ ECO: strictly cap torque so average draw stays low.
+        ◦ NORMAL: normal behavior, allow short peaks.
+        ◦ SPORT: higher peak, but limited duration and enforced cooldown (thermal budget).
+        ◦ LAUNCH/BOOST: allow a short burst (e.g., 5–10 s) with cooldown enforced.
+    3. Peak-duration (energy budget) logic
+        ◦ Track energy_used_window over rolling window (e.g., 1–5 min). If window > budget, throttle down.
+        ◦ Implement per-mode maximum duty cycle for high torque.
+    4. Current & Power governors
+        ◦ Implement PI controllers for current with anti-windup and saturation.
+        ◦ Add a power governor layer: requested torque → check P_elec = torque × ω / η_estimated. If P_elec > permitted, scale down torque.
+    5. Thermal model + governors
+        ◦ Keep a simple thermal integrator: T_est += (P_loss / ThermalCapacity) * dt with convective cooling term. If T_est approaches limit, progressively reduce allowed current.
+    6. Adaptive mode switching (2HB ⇄ 3HB)
+        ◦ Monitor rolling metrics: torque, efficiency, temperature, current headroom.
+        ◦ If 3HB shows better performance currently (higher measured torque per amp, within thermal limits), switch to 3HB. If thermal or current headroom is constrained, fall back to 2HB.
+    7. User warnings / lockouts
+        ◦ Warn user in GUI/console if they repeatedly run sustained BOOST (flash “cooldown required”).
+        ◦ Lock BOOST until safe.
+    8. Logging and telemetry
+        ◦ Log instantaneous: voltages, currents, torque estimate, temps, mode, active DE5 row.
+        ◦ For field tuning, export CSVs automatically when prototype_ready == False or on fault.
+    9. Regeneration & charge recapture
+        ◦ Enable regenerative braking with power clamp to battery and charge management (respect BMS).
+    10. Firmware safety for battery limits (your battery specs)
+        ◦ Implement three battery profiles (as you asked): B1 (48 V, 60 A cont, 100 A peak), B2 (96 V, 100 A cont, 250 A peak), B3 (EV avg — use vehicle spec).
+        ◦ Use those limits to cap I_bus_limit, and enforce peak durations.
+
+D — Active probe pattern (±Δφ probing) — compact pseudocode
+This can be dropped in on the MCU or PC side to implement a small active hill-climb that probes phase offsets safely and measures torque response.
+Concept: intermittently apply a ±Δφ perturbation for N ms, measure resulting short-term torque change, decide whether to step phase in that direction, and respect safety/time limits.
+# PSEUDOCODE (can be ported to MCU C easily)
+# Inputs: base_phi, delta_phi (radians), probe_ms, settle_ms, sample_ms, steps, mode
+# Safety: current/temperature checks must be performed before each probe.
+
+def probe_and_hillclimb(base_phi, delta_phi=0.05, probe_ms=50, settle_ms=30, sample_ms=10, steps=20):
+    # read baseline torque (averaged)
+    T_base = avg_measure_torque(duration_ms=sample_ms, samples=3)
+
+    for step in range(steps):
+        # positive probe
+        set_phase(base_phi + delta_phi)
+        wait_ms(probe_ms)                 # apply perturbation
+        T_pos = avg_measure_torque(duration_ms=sample_ms, samples=3)
+
+        # negative probe
+        set_phase(base_phi - delta_phi)
+        wait_ms(probe_ms)
+        T_neg = avg_measure_torque(duration_ms=sample_ms, samples=3)
+
+        # restore phase to base quickly and allow settle
+        set_phase(base_phi)
+        wait_ms(settle_ms)
+
+        # compare
+        if (T_pos - T_base) > (T_neg - T_base) and (T_pos - T_base) > torque_threshold:
+            # positive direction helps -> step base_phi
+            base_phi += learning_rate * delta_phi
+            T_base = T_pos
+        elif (T_neg - T_base) > torque_threshold:
+            base_phi -= learning_rate * delta_phi
+            T_base = T_neg
+        else:
+            # no improvement: reduce delta or exit
+            delta_phi *= 0.9
+            if delta_phi < min_delta:
+                break
+
+        # safety: abort if overcurrent/overtemp
+        if is_overcurrent() or is_overtemp():
+            set_safe_state()
+            break
+
+    return base_phi
+Practical notes:
+    • avg_measure_torque() is synthetic in earlier sims; on hardware use sensor fusion: measured current × k_t_est ± derivative filters, or an instant power-based torque estimate (P_elec×η / ω) if ω>small.
+    • probe_ms should be short (10–100 ms) to avoid large energy injections; measure carefully.
+    • learning_rate typically 0.5 — step half the probe; reduces noisy hunting.
+    • Implement cooldown/time budgets so probes do not run forever.
+
+E — Immediate actionable changes to your controller code (short list)
+    1. Add current clamping and anti-windup in all PI controllers (you already did clamping; ensure anti-windup).
+    2. Add a power governor layer between DE5 setpoint → current target.
+    3. Implement mode timeouts for high-power modes and enforce cooldown.
+    4. Add probe/hillclimb routine (above) that runs only when thermal and current budgets permit.
+    5. Add adaptive mode switching logic:
+        ◦ Evaluate metrics (rolling averages) every T_eval seconds.
+        ◦ If efficiency_metric improves > X% under 3HB and thermal_ok, switch to 3HB; else revert.
+    6. Ensure safe defaults: on boot, start in ECO, require explicit user action for SPORT/BOOST.
+    7. Telemetry output: include I_bus, I_phase, T_est, mode, active_DE5_row, phase_offset — sample at 10–50 Hz.
+
+F — Controller / hardware recommendations around power electronics & capacitors (short)
+    • GaN vs SiC:
+        ◦ GaN FETs can reduce switching losses and size for very high frequency PWM and high switching rates — they’re excellent if you can afford them and care about peak efficiency & weight.
+        ◦ SiC is better for very high voltages (EV scale); for 48–96V GaN is attractive for efficiency and switching speed. Recommend GaN for high-performance prototypes; provide Si MOSFETs as lower-cost fallback.
+    • Caps / DC bus:
+        ◦ Provide local bulk capacitance across the DC bus (before H-bridge) sized for worst-case transient energy: (E = 0.5 C (\Delta V)^2).
+        ◦ Choose allowed ΔV (e.g., ±5–10% of bus) and worst-case pulse energy (from measured current pulses × voltage × pulse duration). Add calculation tool (Colab) to size C — I can provide that script next.
+        ◦ Use low-ESR film caps for high-pulse performance; supplement with polymer electrolytic for bulk. Supercaps only if you intentionally want big energy buffering — expensive & heavy.
+    • Protection: fast TVS, precharge resistor, inrush limit, diode/flyback handling adapted to inductive loads. Use synchronous rectification/regenerative path rather than simple flyback where practical.
+
+G — Final recommendations / narrative
+    • DE5 advantage: ~15% electrical energy saving in these examples — meaningful for range or smaller battery sizing. Absolute savings bigger at high speed (because base energy is higher).
+    • People will floor it: account for user behavior: enforce safe peak durations, thermal budgets, and have clear user modes.
+    • Offer both controllers: keep the 2HB/3HB switchability in firmware. Provide recommended defaults: 3HB for performance when thermal/currents allow, 2HB as fail-safe/low-power mode.
+    • Logging & telemetry: essential for tuning — collect every ride to refine surrogate models and constraints.
