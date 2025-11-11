@@ -1,0 +1,138 @@
+1x1 controller 39 (Bus Capacitance & Energy Budget Calculator)
+
+Here’s a fully runnable Google Colab-ready Python script that you can paste into a new cell.
+It lets you enter your DC-bus voltage, allowable ripple ΔV, and an array of current pulses I(t) with durations Δt.
+It then computes the required bulk capacitance, stored/released energy, and plots the bus-voltage ripple over time.
+
+🧮 Colab Code — “Bus Capacitance & Energy Budget Calculator”
+# ============================================================
+# Bus Capacitance & Energy Budget Calculator for H-Bridge / Controller
+# Paste into Google Colab and run directly (no data files needed)
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from IPython.display import display
+import pandas as pd
+
+# --- User Inputs -------------------------------------------------------------
+
+V_bus_nom = 48.0         # Nominal DC bus voltage (V)
+V_ripple_allowed = 0.05  # Allowed bus ripple as fraction of Vbus (e.g. 0.05 = ±5%)
+dt = 1e-3                # Simulation time step (s)
+
+# Define current pulse profile:  (Amplitude [A], Duration [ms])
+# Example: rapid ±pulses typical of H-bridge torque bursts
+pulses = [
+    (+60, 10),
+    (0,   10),
+    (-40, 5),
+    (0,   20),
+    (+80, 8),
+    (0,   10)
+]
+
+# Battery / bus ESR (optional, ohms)
+R_source = 0.010   # 10 mΩ for illustration
+
+# -----------------------------------------------------------------------------
+# Derived parameters
+V_min = V_bus_nom * (1 - V_ripple_allowed)
+ΔV_allowed = V_bus_nom - V_min
+
+# Expand the pulse list into time/current arrays
+t, I = [], []
+for amp, dur_ms in pulses:
+    n = int(dur_ms/1000/dt)
+    t.extend([len(t)*dt + i*dt for i in range(n)])
+    I.extend([amp]*n)
+t = np.array(t); I = np.array(I)
+
+# --- Compute total charge and required capacitance ---------------------------
+# Integrate current over time to get total charge change that would cause ΔV
+Q_cum = np.cumsum(I)*dt                     # coulombs
+ΔQ_max = np.max(np.abs(Q_cum - Q_cum[0]))   # peak deviation from start
+C_required = ΔQ_max / ΔV_allowed            # farads
+
+# --- Compute instantaneous bus voltage ripple (for given C) ------------------
+V_ripple = V_bus_nom - (Q_cum - Q_cum[0]) / C_required - I*R_source
+
+# --- Energy computations -----------------------------------------------------
+E_stored_nom = 0.5 * C_required * V_bus_nom**2
+E_min = 0.5 * C_required * np.min(V_ripple)**2
+E_delta = E_stored_nom - E_min
+
+# --- Results table -----------------------------------------------------------
+results = pd.DataFrame({
+    "Parameter": [
+        "Nominal Bus Voltage (V)",
+        "Allowed Ripple (±%)",
+        "ΔV Allowed (V)",
+        "Max Charge Swing (C)",
+        "Required Capacitance (F)",
+        "Stored Energy at Vbus (J)",
+        "Energy Swing during Pulse (J)",
+        "R_source (Ω)"
+    ],
+    "Value": [
+        V_bus_nom,
+        V_ripple_allowed*100,
+        ΔV_allowed,
+        ΔQ_max,
+        C_required,
+        E_stored_nom,
+        E_delta,
+        R_source
+    ]
+})
+display(results)
+
+# --- Plot -------------------------------------------------------------------
+plt.figure(figsize=(7,4))
+plt.subplot(211)
+plt.plot(t*1e3, I)
+plt.ylabel("Current [A]")
+plt.title("Input Current Pulses")
+plt.grid(True)
+
+plt.subplot(212)
+plt.plot(t*1e3, V_ripple)
+plt.ylabel("Bus Voltage [V]")
+plt.xlabel("Time [ms]")
+plt.title("Bus Voltage Ripple with C = %.2f mF" % (C_required*1e3))
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+# ============================================================
+
+🧠 How to Use
+    1. Open Google Colab → New Notebook.
+    2. Paste the code above and run the cell.
+    3. Edit:
+        ◦ V_bus_nom → your system voltage (e.g. 48 V, 96 V, 400 V).
+        ◦ V_ripple_allowed → fractional ripple (e.g. 0.05 = ±5 %).
+        ◦ pulses → list of (current [A], duration [ms]) pairs representing your load bursts.
+    4. The table shows the required capacitance (F) and energy swing, and the plots show current pulses and resulting bus-voltage ripple.
+
+🔧 Example Interpretation
+If the script reports
+Required Capacitance ≈ 4.7 mF
+then suitable real-world candidates might be:
+Function
+Type
+Example
+Notes
+Main bulk
+Film (PP)
+KEMET R76, EPCOS B3277x
+Low ESR, high ripple, long life
+Support
+Polymer Electrolytic
+Panasonic OS-CON (470 µF × 3 parallel)
+Fills high-frequency gaps
+Optional buffer
+Supercap module
+Maxwell 2.7 V × 350 F (series stack × N for bus V)
+Use only if you want extended transient support
+You can re-run the notebook with different ΔV limits or current pulses (e.g. from your measured I(t) traces) to instantly see the capacitance and energy effects for each battery case.
+
