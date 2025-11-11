@@ -1,0 +1,171 @@
+1x1 controller 36 (Active-Probe hill-climb — concept, sequencing, and code)
+
+
+1) Active-Probe hill-climb — concept, sequencing, and code
+Goal: replace the passive hill-climb with an active probe that briefly applies φ = φ_offset ± Δφ for T_probe (ms), measures torque while each probe is active, and accepts the direction (or magnitude) that increased measured torque. Repeat until convergence or maximum probes.
+Key ideas / safety rules
+    • Probes must be short relative to system time constants (electrical/mechanical), but long enough to get a clean torque reading (e.g., multiple controller update cycles).
+    • Always return to a safe baseline φ_offset after probing if probe produces bad transient.
+    • Rate-limit φ changes and cap probe amplitudes to avoid mechanical stress or large inrush currents.
+    • Use statistical averaging (mean over probe window) to reduce noise sensitivity.
+    • Include an acceptance margin to avoid accepting noise-driven improvements.
+    • Probe scheduling: do N probes, or stop early if no improvement for M consecutive probes; decay step-size (Δφ) on success/failure (annealing).
+Below is a ready-to-drop-in Python routine. It is written to integrate into the DE5Controller module you already have. It requires the caller to supply a measure_torque() callback that returns instantaneous torque (or the latest measured torque). The routine will sample torque at the controller update rate while the probe is active.
+# Insert into de5_controller.py (or import it). This is an "active probe" helper
+# to be used inside DE5Controller._adaptive_phase_hill_climb or called externally.
+
+import time
+import numpy as np
+
+class ActiveProbeHelper:
+    def __init__(self,
+                 delta_phi_init=0.05,      # initial probe amplitude (rad)
+                 delta_phi_min=0.001,
+                 delta_phi_max=0.5,
+                 probe_duration=0.06,      # seconds (60 ms) - user tune
+                 sample_interval=0.005,    # seconds between torque reads (~200 Hz)
+                 accept_margin=0.02,       # relative torque increase to accept probe
+                 max_probes=5,
+                 safety_phi_rate=50.0):    # rad/s
+        self.delta_phi = delta_phi_init
+        self.delta_phi_min = delta_phi_min
+        self.delta_phi_max = delta_phi_max
+        self.probe_duration = probe_duration
+        self.sample_interval = sample_interval
+        self.accept_margin = accept_margin
+        self.max_probes = max_probes
+        self.safety_phi_rate = safety_phi_rate
+
+    def _safe_set_phi(self, controller, target_phi, dt):
+        """Set controller.phi_offset (or controller.outputs['phi_cmd']) with rate limiting."""
+        prev = controller.outputs.get('phi_cmd', 0.0)
+        max_delta = abs(self.safety_phi_rate * dt)
+        d = controller._angle_diff(target_phi, prev)
+        d = float(np.clip(d, -max_delta, max_delta))
+        controller.outputs['phi_cmd'] = prev + d
+        # also push to controller.phi_offset if that is the maintained coarse offset:
+        controller.phi_offset = controller.outputs['phi_cmd']
+
+    def run_probe(self, controller, measure_torque_fn, dt,
+                  base_phi=None, probe_duration=None, delta=None):
+        """
+        Run a single ±delta probe sequence and return the chosen new phi_offset.
+        Arguments:
+            controller: instance of DE5Controller (or compatible)
+            measure_torque_fn: callable () -> float (instant torque)
+            dt: controller step interval (s)
+            base_phi: optional baseline phi; default controller.phi_offset
+            probe_duration: seconds (overrides helper default)
+            delta: probe amplitude (rad)
+        Returns:
+            (accepted_phi, info_dict) where accepted_phi is the new coarse phi_offset,
+            info_dict has diagnostic data (torque_base, torques_plus, torques_minus, accepted)
+        """
+        if base_phi is None:
+            base_phi = controller.phi_offset
+        if probe_duration is None:
+            probe_duration = self.probe_duration
+        if delta is None:
+            delta = self.delta_phi
+
+        # compute sample counts (rounded)
+        n_samples = max(1, int(np.ceil(probe_duration / self.sample_interval)))
+        t_step = self.sample_interval
+
+        # 1) measure baseline torque for short averaging window
+        baseline_samples = []
+        for _ in range(max(1, int(np.ceil(0.02 / t_step)))):  # 20 ms baseline
+            baseline_samples.append(float(measure_torque_fn()))
+            time.sleep(t_step)
+        torque_base = float(np.mean(baseline_samples))
+
+        # 2) apply +delta probe and sample
+        phi_plus = base_phi + delta
+        torques_plus = []
+        # set phi to phi_plus safely
+        self._safe_set_phi(controller, phi_plus, dt)
+        # give a small settling time (one or two sample intervals)
+        time.sleep(t_step)
+        for _ in range(n_samples):
+            torques_plus.append(float(measure_torque_fn()))
+            time.sleep(t_step)
+
+        # 3) go back to baseline briefly
+        self._safe_set_phi(controller, base_phi, dt)
+        time.sleep(t_step * 0.5)
+
+        # 4) apply -delta probe and sample
+        phi_minus = base_phi - delta
+        torques_minus = []
+        self._safe_set_phi(controller, phi_minus, dt)
+        time.sleep(t_step)
+        for _ in range(n_samples):
+            torques_minus.append(float(measure_torque_fn()))
+            time.sleep(t_step)
+
+        # 5) restore baseline
+        self._safe_set_phi(controller, base_phi, dt)
+        time.sleep(t_step)
+
+        mean_plus = float(np.mean(torques_plus)) if torques_plus else torque_base
+        mean_minus = float(np.mean(torques_minus)) if torques_minus else torque_base
+
+        # decide which direction improved torque relative to baseline
+        # compare relative to base to avoid tiny absolute differences
+        rel_plus = (mean_plus - torque_base) / (abs(torque_base) + 1e-9)
+        rel_minus = (mean_minus - torque_base) / (abs(torque_base) + 1e-9)
+
+        accepted = False
+        chosen_phi = base_phi
+        chosen_rel = 0.0
+        if rel_plus > self.accept_margin and rel_plus >= rel_minus:
+            chosen_phi = phi_plus
+            accepted = True
+            chosen_rel = rel_plus
+        elif rel_minus > self.accept_margin and rel_minus > rel_plus:
+            chosen_phi = phi_minus
+            accepted = True
+            chosen_rel = rel_minus
+        else:
+            # no clear improvement: optionally shrink delta to refine search
+            self.delta_phi = max(self.delta_phi * 0.6, self.delta_phi_min)
+            chosen_phi = base_phi
+            accepted = False
+            chosen_rel = max(rel_plus, rel_minus)
+
+        info = {
+            'torque_base': torque_base,
+            'mean_plus': mean_plus,
+            'mean_minus': mean_minus,
+            'rel_plus': rel_plus,
+            'rel_minus': rel_minus,
+            'accepted': accepted,
+            'chosen_phi': chosen_phi,
+            'delta_phi': self.delta_phi,
+            'chosen_rel': chosen_rel
+        }
+
+        # if accepted, update controller's coarse phi_offset and optionally shrink delta (anneal)
+        if accepted:
+            # commit new phi slowly (rate limiter still active)
+            self._safe_set_phi(controller, chosen_phi, dt)
+            controller.phi_offset = controller.outputs['phi_cmd']
+            # tighten probe amplitude to refine
+            self.delta_phi = max(self.delta_phi * 0.85, self.delta_phi_min)
+        else:
+            # if not accepted, optionally expand a bit to escape plateau (safely)
+            self.delta_phi = min(self.delta_phi * 1.1, self.delta_phi_max)
+
+        return controller.phi_offset, info
+How to use in your control loop
+    • Create one ActiveProbeHelper() and call run_probe() during low-dynamics periods or when |torque_error| exceeds threshold.
+    • Example strategy:
+        1. If torque error > 5% and not probing recently, call run_probe() once (±Δφ).
+        2. If accepted, continue normal operation; if not, optionally try reverse sign or increase Δφ up to max and re-run.
+        3. Do at most max_probes back-to-back probes to avoid disrupting the ride.
+    • Always log info returned for offline review.
+Tuning suggestions
+    • probe_duration: 30–120 ms typically. Shorter for fast electrical time constants; longer if mechanical inertia is large.
+    • sample_interval: 2–10 ms depending on telemetry bandwidth.
+    • accept_margin: 1–5% relative increase is a pragmatic starting point depending on noise level.
+    • delta_phi_init: 0.03–0.2 rad (≈1.7°–11°). Smaller if already near optimum.
