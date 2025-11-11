@@ -1,0 +1,146 @@
+QMD for BLDC motor 4 (algebraic, rational-style expressions)
+
+
+we can absolutely replace every cos(θ) / transcendental dependency with algebraic, rational-style expressions using Wildberger’s Rational Trigonometry (RT) and its hyperbolic extension (UHG). That gives you two big wins:
+    • No transcendental functions (sin/cos/atan) in the inner loop — you can work with polynomials, dot-products and squared quantities only.
+    • Safer, faster numeric ops (you can even use exact rationals or integer arithmetic for symbolic checks), and you can optimize using squared torque or algebraic proxies so you never need a square root in performance-critical code.
+Below I give the theory in short, then concrete, Colab-ready Python code you can drop into your pipeline. The code demonstrates: Euclidean RT (spread / quadrance → squared torque), the analogous hyperbolic (UHG) mapping using a Green metric, and how to use squared-torque as an algebraic objective so no trig or sqrt is required in the core loop.
+
+1 — Algebraic replacement of cos(θ) using Rational Trigonometry (RT)
+Euclidean RT (key objects)
+    • For two vectors (u=(x_1,y_1)) and (v=(x_2,y_2)) define the quadrances (squared norms)
+[
+Q_u = x_1^2 + y_1^2,\qquad Q_v = x_2^2 + y_2^2.
+]
+    • Define the Euclidean dot (D = x_1 x_2 + y_1 y_2).
+    • Wildberger’s spread (S) between the lines is
+[
+S ;=; 1 - \frac{D^2}{Q_u Q_v}.
+]
+This is algebraic (only additions, multiplications, divisions).
+Relation to cosine
+[
+\cos^2\theta = 1 - S ;=; \frac{D^2}{Q_u Q_v}.
+]
+So instead of using (\cos\theta) we can use (D/\sqrt{Q_u Q_v}). To remove the square root entirely, use squared torque.
+Torque algebraic proxy
+If torque is proportional to (\cos\theta): (T \propto k_t I \cos\theta), then
+[
+T^2 ;\propto; k_t^2 I^2 \cos^2\theta ;=; k_t^2 I^2 \frac{D^2}{Q_u Q_v}.
+]
+All operations are algebraic (no trig, no sqrt) if you work with (T^2) or the ratio (D^2/(Q_u Q_v)) as the objective.
+You can also recover the sign of (\cos\theta) from the sign of (D) if needed:
+[
+\mathrm{sign}(\cos\theta) = \mathrm{sign}(D).
+]
+
+2 — Hyperbolic (UHG) version — replace Euclidean dot/quadrance with Green-form
+To move from Euclidean to Universal Hyperbolic Geometry (UHG) we replace the Euclidean inner product with a Green (metric) bilinear form (G(\cdot,\cdot)). For a 2D hyperbolic model with metric matrix (H) (signature (+,-) or (-,+)):
+Choose metric matrix (H=\begin{pmatrix}1 & 0\0 & -1\end{pmatrix}) (example). Then:
+    • hyperbolic quadrance
+[
+Q_u^{(h)} = u^\top H u = x_1^2 - y_1^2,
+]
+(similar for (Q_v^{(h)})) — note sign matters, you must check causal/sign validity for your vectors.
+    • Green product
+[
+G = u^\top H v = x_1 x_2 - y_1 y_2.
+]
+    • hyperbolic spread (by analogy)
+[
+S_h = 1 - \frac{G^2}{Q_u^{(h)} Q_v^{(h)}}.
+]
+    • hyperbolic cosine analog (algebraic)
+[
+\text{(algebraic factor)}\quad \frac{G^2}{Q_u^{(h)} Q_v^{(h)}}\qquad\text{plays the same role as }\cos^2\theta.
+]
+Thus squared-torque in hyperbolic metric:
+[
+T^2 \propto k_t^2 I^2 \cdot \frac{G^2}{Q_u^{(h)} Q_v^{(h)}}.
+]
+Notes / cautions for UHG:
+    • Quadrances (Q_u^{(h)}) can be negative (timelike/spacelike). Handle signs carefully (you may restrict to vectors where product is positive or use absolute values depending on physical interpretation).
+    • The metric (H) can be adapted to the exact Green form you want for field geometry — above is the canonical simple choice.
+
+3 — Why this is advantageous for control/optimization
+    • Algebraic objective: maximize (D^2/(Q_u Q_v)) (Euclidean) or (G^2/(Q_u^{(h)} Q_v^{(h)})) (UHG) to maximize squared torque. No trig or sqrt inside optimizer.
+    • Monotone mapping: maximizing squared torque also maximizes torque (monotone transform), so it’s safe for ranking and selection.
+    • Exact rational computations: you can implement using fixed-point or rational arithmetic (fractions) in embedded contexts to avoid floating point error accumulation.
+    • Faster: multiplications/divisions are cheaper than trig and sqrt at high sample rates. Good for MCU inner loops.
+
+4 — Concrete Colab-ready Python snippet (Euclidean RT + UHG option)
+Drop this into your pipeline / Colab. It computes algebraic torque proxies (squared) for Euclidean RT and UHG, shows equivalence with cos for sanity, and demonstrates using squared torque as the control objective.
+# Algebraic torque proxy: Rational Trig (RT) + UHG hyperbolic option
+import numpy as np
+
+def quadrance(u):
+    # Euclidean quadrance
+    return u[0]*u[0] + u[1]*u[1]
+
+def dot_euclid(u, v):
+    return u[0]*v[0] + u[1]*v[1]
+
+def euclid_squared_torque_proxy(k_t, I, u, v):
+    # returns value proportional to T^2 without using trig
+    D = dot_euclid(u, v)
+    Qu = quadrance(u)
+    Qv = quadrance(v)
+    if Qu==0 or Qv==0:
+        return 0.0
+    return (k_t*k_t)*(I*I) * (D*D) / (Qu*Qv)
+
+# Hyperbolic (UHG) with metric H = diag(1,-1)
+def hyper_quadrance(u):
+    return u[0]*u[0] - u[1]*u[1]
+
+def green_product(u, v):
+    return u[0]*v[0] - u[1]*v[1]
+
+def uhg_squared_torque_proxy(k_t, I, u, v):
+    G = green_product(u, v)
+    Qu = hyper_quadrance(u)
+    Qv = hyper_quadrance(v)
+    # guard against zero denom or opposite signs as needed
+    denom = Qu*Qv
+    if denom == 0:
+        return 0.0
+    return (k_t*k_t)*(I*I) * (G*G) / denom
+
+# sanity comparison demo
+k_t = 0.12
+I = 50.0
+# build two vectors representing coil field directions (unit-like but not necessary)
+theta_deg = 5.0
+theta = np.deg2rad(theta_deg)
+u = np.array([1.0, 0.0])           # reference field
+v = np.array([np.cos(theta), np.sin(theta)])  # rotated field
+
+sqT_proxy = euclid_squared_torque_proxy(k_t, I, u, v)
+cos_based = (k_t * I * np.cos(theta))**2
+
+print("Euclid proxy T^2:", sqT_proxy)
+print("cos-based T^2:", cos_based)
+print("ratio proxy/cos:", sqT_proxy / (cos_based + 1e-18))
+
+# UHG example (choose vectors with appropriate sign behavior)
+u_h = np.array([1.0, 0.01])   # slightly off-axis vector
+v_h = np.array([np.cos(theta), np.sinh(theta*0.01)])  # hyperbolic-like test
+uhg_proxy = uhg_squared_torque_proxy(k_t, I, u_h, v_h)
+print("UHG proxy T^2 (algebraic):", uhg_proxy)
+Integration tips
+    • Replace any cos(phase_error) multiplier in your torque setpoint with sign(D) * sqrt( D^2/(Qu*Qv) ) only if you want torque sign; otherwise use D and Qu,Qv directly and work with squared-torque for optimization (no sqrt).
+    • For control that needs signed torque, compute sign from D and use algebraic amplitude from |D|/sqrt(Qu Qv); compute sqrt only once per control frame if absolutely required — but for search / hill-climb, squared values are usually enough.
+
+5 — How to use this in practice in the QMD/DE5 pipeline
+    1. Field vectors extraction — define u and v as algebraic proxies for the direction/phase of stator and rotor fields.
+        ◦ Example: obtain vector components from sensor-derived phasors or from commanded setpoints without trig: use measured ADC phasor components (I_cos, I_sin) directly as algebraic coordinates.
+    2. Compute squared torque objective with euclid_squared_torque_proxy(...) (or uhg_...).
+    3. Hill-climb / optimizer operates on algebraic objective (maximizing ratio D^2/(Qu Qv)), no trig needed inside the inner loop.
+    4. Saturation detection: monitor ratio of D^2/(Qu Qv) vs some threshold to detect destructive interference (low ratio), or detect field misalignment.
+    5. Phase tracking: to compute a correction you can compare algebraically two candidate offsets ±Δ and pick the one with greater squared-torque — this is a pure algebraic comparison (no trig), ideal for MCU.
+
+6 — Numerical / implementation notes and caveats
+    • Divide-by-zero / sign handling: check Q_u and Q_v aren't zero; in hyperbolic mode watch sign of quadrances and decide how to interpret negative denominators (use absolute or restrict to physically meaningful vectors).
+    • Precision: using squared quantities increases dynamic range; consider fixed-point scaling or double precision depending on MCU. Using rational arithmetic (Python fractions or arbitrary precision) is possible for symbolic checks.
+    • Physical mapping: UHG/Green metric must be selected to match the physical field geometry you assert — the simple diag(1,-1) is a prototype; adapt H to the field invariants you want to model.
+    • Testing: validate algebraic proxy against ground truth (cos-based) over the operating envelope. Use the earlier Colab notebook and replace cos → algebraic proxy; produce parity plots (proxy vs trig) to quantify approximation fidelity.

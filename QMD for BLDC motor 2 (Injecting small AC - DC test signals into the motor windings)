@@ -1,0 +1,196 @@
+QMD for BLDC motor 2 (Injecting small AC - DC test signals into the motor windings)
+
+this is a very powerful idea. Injecting small AC/DC test signals into the motor windings to sense electrical & magnetic state gives you extra observability (R, L, mutual M, saturation, pole alignment, air-gap proxy, temperature, rotor position refinement and faults) without adding sensors. Below I give a practical, safety-minded blueprint: how to inject, what to measure, how to extract parameters, how to integrate into control, and exactly how to quantify the improvement (experiments + metrics + analyses).
+
+1 — Big picture: what you gain
+By using the coils themselves as sensors you can infer:
+    • Winding resistance R(T) → temperature and winding health.
+    • Inductance L (and its variation with rotor position) → air-gap / pole alignment proxy and magnetic saturation indicators.
+    • Mutual inductance / coupling between rotor/stator coils → coupling strength (useful for DDS and wireless coupling).
+    • Back-EMF waveform shape & zero-crossings → higher-resolution rotor angle estimates beyond 3-hall interpolation.
+    • Nonlinear behavior (e.g., L(R) vs I) → detect saturation and compute I_sat for saturation model.
+    • Mechanical events / vibration via electrical noise or high-frequency impedance modulation (detection of rubbing / shorted turns).
+All of this can feed the DE5/QMD blocks: better phase offsets, saturation compensation, thermal derating, mode switching, fault detection, and adaptive morphing.
+
+2 — Where & how to inject the test signal (safe, non-invasive)
+Three practical injection approaches — choose one or combine:
+A. Superimposed HF carrier on PWM (preferred for continuous sensing)
+    • Superimpose a small amplitude high-frequency (HF) carrier (e.g., 1–5 kHz above audible but below switching limits) on the PWM commanded current or on the PWM duty in a way that the average torque change is negligible.
+    • Carrier amplitude: small fraction of rated current (e.g., 1–5% of I_nom) to avoid torque perturbation.
+    • Advantages: continuous, non-blocking, synchronous demodulation possible.
+B. Short low-energy test bursts during low-torque windows
+    • Inject short sinusoidal or square test pulses (tens of ms) when vehicle is coasting or during controlled idle times (e.g., at startup, speed dips).
+    • Good when you cannot continuously inject or want larger SNR for tougher measurements.
+C. DC step pulses (resistance & saturation test)
+    • Apply short DC current increments (e.g., +ΔI for 10–50 ms) and measure ΔV and time-constant → extract R and L and observe nonlinear B saturation as I increases.
+    • Use small increments and clamp to thermal/current limits.
+Important safety rules
+    • Always clamp injected amplitude so I_inject + I_operational ≤ I_bus_limit and obey thermal margin.
+    • Avoid injections during critical transients (hard braking, user torque requests) unless explicitly permitted.
+    • Ensure EMI and BMS rules permit the injected spectrum; provide a disable flag from BMS/vehicle state.
+    • Add firmware watchdog reverting to safe mode if ADCs saturate or unexpected behavior detected.
+
+3 — Practical hardware requirements
+    • Bidirectional current measurement per phase (shunt + fast ADC) with bandwidth > 10× highest injection frequency.
+    • Voltage sensing at phase nodes or at DC bus; phase node sensing requires isolated measurement or careful switching-synchronous sampling.
+    • DAC or filtered PWM to generate the carrier (MCU timer + small amplitude).
+    • Anti-alias filters, synchronous sampling (time-align ADC to injected carrier).
+    • Optional: small measurement capacitor on phase node for HF measurement clarity (beware modifying motor electrical environment).
+    • Fast ADC sampling (sample at least 8–10 samples per carrier cycle), or use synchronous demodulation via multiply+low-pass on sampled streams.
+
+4 — Signal design: frequencies, amplitudes, waveforms
+    • Carrier frequency: choose f_carrier well above fundamental mechanical frequencies and mechanical noise but below switching harmonic problems — e.g., 1–5 kHz if switching at 20–50 kHz. Avoid multiples of PWM base switching.
+    • Amplitude: typically 1–5% of rated phase current (e.g., if nominal 100 A, injection 1–5 A). Lower amplitude reduces disturbance, but reduces SNR.
+    • Waveform: sine is ideal for impedance estimation; pseudo-random binary sequence (PRBS) or chirps let you probe multiple frequencies in one short burst.
+    • Sync: use phase-locked injection (align carrier to rotor angle or PWM ticks) for reproducible demodulation.
+
+5 — What to measure & how to compute quantities (practical formulas)
+A. DC resistance R (and temperature)
+    • Inject small DC pulse ΔI and record ΔV across winding:
+[
+R = \Delta V / \Delta I
+]
+    • Use R(T) coefficient to estimate temperature:
+[
+T \approx T_{ref} + (R/R_{ref}-1)/\alpha_{Cu}
+]
+where α_Cu ≈ 0.0039 /°C.
+B. Small-signal impedance Z(jω) → R + jωL
+    • With sinusoidal injection at ω:
+[
+Z = V_{ac} / I_{ac} = R + jωL \quad\Rightarrow\quad L = \mathrm{Im}(Z)/ω
+]
+    • Implement synchronous demod: multiply measured v(t) and i(t) by sin(ωt)/cos(ωt), low-pass to get in-phase and quadrature components.
+C. Mutual coupling M (between coils)
+    • Drive coil A with carrier, measure induced voltage on coil B (open-circuit or with high impedance sense).
+    • Mutual inductance:
+[
+M = V_{B,ac} / (jω I_{A,ac})
+]
+    • Normalized coupling k = M / sqrt(L_A L_B).
+D. Position-dependent L(θ)
+    • Sweep θ (use hall interpolated angle) while measuring L at fixed injection → produce L(θ) map. Peaks/troughs correlate with pole centers/air-gap changes. Use this to refine rotor angle estimate.
+E. Saturation detection
+    • Measure L vs I: if L decreases with increasing I (dL/dI < 0), you're entering saturation. Use this to estimate I_sat (current where L reduces by X%).
+    • Fit a simple model: ( L(I) = L_0/(1+(I/I_{sat})^n) ), estimate I_sat, n via 2–3 DC steps.
+F. Rotor position refinement & back-EMF shape
+    • Use high-rate sampling of back-EMF during zero-current intervals or short injection windows to refine angle (harmonics reveal pole shape).
+    • Combine with L(θ) and mutual-k(θ) maps for very accurate position.
+
+6 — Signal processing recipes (MCU / PC)
+    • Synchronous demodulation (lock-in amplifier approach):
+        1. Multiply measured v(t) and i(t) by cos(ωt) and sin(ωt).
+        2. Low-pass filter (IIR or moving average) to yield in-phase (X) and quadrature (Y) components.
+        3. Compute amplitude and phase: A = sqrt(X²+Y²), φ = atan2(Y,X).
+        4. Z_real = V_in_phase / I_in_phase etc.
+    • Chirp / broadband:
+        1. If you can record a burst and upload to PC, run FFT / spectral division to compute Z(f).
+        2. Useful for frequency-dependent phenomena (skin effect, complex core losses).
+    • DC step response:
+        1. Fit exponential v(t) for RC/RL time-constant: τ = L / R; estimate L and R.
+    • Averaging & outlier rejection to deal with torque pulsations and variable load.
+
+7 — Integration into control & use cases
+    1. Online rotor-angle refine: Use L(θ) or back-EMF harmonic signatures to interpolate angle between hall transitions → reduce commutation timing error.
+    2. Adaptive saturation compensation: Estimate I_sat online → reduce commanded I or apply nonlinear k_t(I) compensation.
+    3. Dynamic coupling tuning for DDS: Monitor mutual M; adjust drive amplitudes or gap if coupling falls below threshold.
+    4. Thermal health & predictive derating: R(T) → real-time coil temp estimate → dynamic continuous current limit.
+    5. Fault detection: sudden R increase (open/partial short), L anomalies (shorted turns), or unusual induced noise → flag maintenance.
+    6. Controller mode switching: if mutual coupling low or noise high, switch to a topology less sensitive (e.g., 2HB vs 3HB).
+
+8 — How to quantify the improvement (experiment design)
+You must provide objective evidence of benefit. Run an A/B controlled experimental protocol:
+A. Baseline vs Sensing-enabled
+    • Baseline: stock controller, no injection.
+    • Sensing-enabled: QMD control using coil-sensed features (e.g., phase offset refined via online L(θ) and saturation compensation).
+B. Test conditions
+    • Reproducible load: dyno or fixed weight/road speed simulations.
+    • Multiple operating points: idle, cruise (24 km/h), hill climb (torque demand high), start/stop cycles.
+    • Repeat N times (≥10) for statistical significance.
+C. Metrics to collect
+    • Electrical energy used (Wh) for the trip or test.
+    • Mechanical work output (torque × angular displacement) or speed × torque integrated → compute efficiency.
+    • Peak & RMS currents; I²R losses estimation.
+    • Coil temperature vs time; thermal margin.
+    • Torque per amp (Nm/A) and torque ripple.
+    • Controller stability metrics (overshoot, settling time in speed step tests).
+    • Fault detection false positive/negative rates (if testing diagnostics).
+D. Quantify improvement
+    • Compute % energy saved: (E_baseline − E_QMD)/E_baseline ×100.
+    • Efficiency improvement: Δη = η_QMD − η_baseline.
+    • Range extension estimate: scale Wh/km difference.
+    • Statistical tests: report mean ± std and perform t-test or non-parametric test for significance (p<0.05).
+    • For controller stability, compare metrics: rise time, overshoot, settling time.
+E. Example expected outcomes
+    • Phase refinement → lower torque per amp by 5–15%.
+    • Saturation compensation → reduces I peaks and heating; extends continuous power by X% (empirical).
+    • Combined → 5–20% energy per trip reduction typical (depending on baseline).
+
+9 — Example MCU pseudocode (injection + lock-in demod)
+// Called at high rate synchronized to carrier
+void carrierISR() {
+  // generate carrier-aware PWM or DAC to inject small current
+  // assume injection amplitude is set in controller state
+  update_injection_phase();
+
+  // sample ADCs (V_phase, I_phase) synchronized to carrier
+  float v = adc_read_voltage();
+  float i = adc_read_current();
+
+  // synchronous demod (cos & sin precomputed per tick)
+  float cos_t = cos_table[idx];
+  float sin_t = sin_table[idx];
+  Xv += v * cos_t;
+  Yv += v * sin_t;
+  Xi += i * cos_t;
+  Yi += i * sin_t;
+
+  idx = (idx + 1) % TABLE_LEN;
+  if(idx==0) {
+    // one lock-in cycle complete -> compute Z
+    float Vx = LPF_filter(Xv);
+    float Vy = LPF_filter(Yv);
+    float Ix = LPF_filter(Xi);
+    float Iy = LPF_filter(Yi);
+
+    float V_amp = sqrtf(Vx*Vx + Vy*Vy);
+    float I_amp = sqrtf(Ix*Ix + Iy*Iy);
+    float Z_mag = V_amp / I_amp;
+    float Z_phase = atan2f(Vy, Vx) - atan2f(Iy, Ix);
+    float R_est = Z_mag * cosf(Z_phase);
+    float L_est = Z_mag * sinf(Z_phase) / (2.0f * M_PI * f_carrier);
+
+    // publish values to control thread
+    publish_impedance(R_est, L_est);
+    Xv = Yv = Xi = Yi = 0;
+  }
+}
+Use this to build L(θ) maps by recording L_est vs θ_est (from hall interpolation).
+
+10 — Validation plan & metrics to report back
+    1. Initial bench validation
+        ◦ Static: measure R via DC steps, compare with thermometer reading. Validate R→T calibration.
+        ◦ Dynamic: verify L measurement repeatability across θ and I.
+    2. Controller integration
+        ◦ Compare rotor-phase error distribution before/after using L(θ)-based interpolation.
+        ◦ Run step tests: measure speed/torque response improvements (rise time, overshoot).
+    3. Energy & thermal trials
+        ◦ Run standardized route/trip simulation: compute Wh/km baseline vs sensing-enabled.
+        ◦ Report mean energy saving, temp profiles and statistical significance.
+    4. Diagnostics & robustness
+        ◦ Induce small faults (e.g., forced short in a few turns emulated) and test detection ROC.
+
+11 — Practical pitfalls & advice
+    • SNR: injected amplitude must be large enough to be measurable but small enough to avoid torque disturbance. Use averaging & synchronous demod to boost SNR.
+    • Interference with PWM: schedule injection or choose carrier frequency carefully to avoid aliasing with switching.
+    • Thermal drift: R(T) provides good estimate but requires calibration per motor build.
+    • Processing load: lock-in demod requires DSP loops; choose MCU with sufficient ADC rate and CPU (Cortex-M4/ M7 recommended).
+    • Regulatory/EMI: injection may create EMI; test emissions if vehicle will go to certification.
+
+12 — Quick deployment roadmap (practical steps)
+    1. Implement continuous low-amplitude carrier injection + lock-in demod on bench (one phase).
+    2. Validate R/L measurement repeatability (target CV < 1–2%).
+    3. Build L(θ) and mutual M(θ) maps (store in flash).
+    4. Add saturation estimator (L vs I) and I_sat computation.
+    5. Integrate into DE5/QMD block: use for phase refine, saturation compensation, and thermal limits.
+    6. Run A/B energy/thermal tests, compute improvements and refine injection amplitude/period.

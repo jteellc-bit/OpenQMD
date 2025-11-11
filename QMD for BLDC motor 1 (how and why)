@@ -1,0 +1,130 @@
+QMD for BLDC motor 1 (how and why)
+
+Short answer: yes — you can make a typical BLDC noticeably more efficient with a QMD-style controller using only existing, off-the-shelf sensors (3 Halls + basic current/temperature/BMS telemetry). The gains won’t be magic, but they can be substantial and practical — especially for systems where the stock controller is conservative or uses coarse commutation. Below I outline how, why, and exactly what to implement/test to get the biggest real-world impact, plus concrete algorithms, safety rules, and an experimental plan.
+
+1) Why QMD helps a stock BLDC (intuition)
+QMD (as you’ve framed it) leverages phase-coherent control: it searches for and enforces commutation/drive sequences that produce constructive field interactions and forbid destructive ones. For a BLDC that means:
+    • Minimizing destructive phase overlap and timing errors (deadtime, phase lag) that waste current as heat.
+    • Applying phase advance/retard (fine timing offsets) to track the rotor-field optimum across speed/load/temperature.
+    • Using multi-sensor context (temperature, battery state, measured currents) to adapt operating point for best torque per amp and lower loss.
+All of that is achievable with hall timing + current + temp + BMS signals: you do not need optical encoders or exotic sensors to get meaningful improvement.
+Expected practical benefits:
+    • Higher torque per amp (lower delivered current for same torque).
+    • Lower copper losses (I²R) for the same mechanical output.
+    • Better regenerative behavior and battery-aware power management.
+    • Thermal headroom (less coil heating) → longer sustained power and higher effective range.
+Gains depend on baseline controller quality; rough realistic improvements: 5–20% energy per trip in favorable cases; bigger if stock controller is poor.
+
+2) Highest-impact, practical interventions (ranked)
+    1. Fine phase-advance/phase-search (constructive phase locking)
+        ◦ Add a continuous micro-probe that nudges commutation timing ±Δφ and measures torque/back-EMF/current to find the phase that maximizes torque per amp. Non-blocking ISR approach (your probe FSM) fits perfectly.
+        ◦ Big win because most stock controllers use fixed timing or coarse hall interpolation.
+    2. Real-time thermal derating + dynamic current setpoint
+        ◦ Use motor temperature and battery/bms temps to reduce I_set or alter target torque so losses and coil temp stay within margin, preserving long-term efficiency.
+    3. Current waveform shaping (reduce destructive overlap)
+        ◦ Where hardware allows, modulate PWM timing to reduce simultaneous phase conduction or to center phase current on the instant of max torque. Reduces copper/core losses.
+    4. Adaptive dead-time compensation
+        ◦ Measure small back-EMF signature or use current transients to estimate MOSFET switching delays and compensate, reducing dissipation from inappropriate commutation windows.
+    5. Battery-aware power scheduling
+        ◦ Use BMS telemetry (available packs) to cap instantaneous power, optimize regen profile, and avoid battery inefficiencies (high-IR losses). That yields better delivered range for the pack.
+    6. Lightweight sensor fusion / observer for better rotor angle estimate
+        ◦ Hall-interpolated angle with a simple observer (phase-locked loop or slope-corrector) gives finer commutation without extra sensors.
+    7. Passive thermal design improvements (graphoil + minimal heat pipes + fins)
+        ◦ Thermal upgrades enable higher continuous current (not strictly QMD, but multiplies its benefit).
+    8. Switch to faster switching MOSFETs (SiC → GaN where feasible)
+        ◦ Reduces conduction and switching losses so the controller’s fine timing yields more net gains.
+
+3) Concrete control algorithm (MCU-friendly, uses only existing sensors)
+Overview: inner current loop per coil, outer speed/torque loop. QMD block sits between outer loop and current setpoints, producing phase and relative phasor magnitudes to be realized by PWM/H-bridges.
+Pseudo-flow (executed every PWM cycle or controller tick — e.g., 1 kHz outer, 10–20 kHz inner):
+    1. Read sensors:
+        ◦ HALL_A/B/C timestamps → compute coarse rotor angle θ_hall
+        ◦ Current sensors (shunt or ADC) → I_phase(s)
+        ◦ Motor temperature T_motor
+        ◦ BMS: V_bus, I_bus_limit, cell temps/voltages
+    2. Estimate refined rotor angle θ_est:
+        ◦ Interpolate between hall transitions using measured Δt and an encoderless PLL (or simple linear interpolation with speed estimate).
+        ◦ Optionally apply small observer correction using back-EMF zero crossings.
+    3. DE5/QMD setpoint generator:
+        ◦ Input: θ_est, desired torque/speed, recent thermal/battery limits.
+        ◦ Output: target commutation phase offset φ_target (continuous), and target effective coil phasors (I_target per coil or phasor magnitude & phase).
+        ◦ Implementation: read DE5 parameter table row (based on operating regime) → compute φ_target = base_phase + adaptive_offset(θ_est, DE5_params).
+    4. Current controller:
+        ◦ Convert phasor setpoints to per-coil current references (I_ref_a,b,c).
+        ◦ Run PI current loops per coil (fast inner loop) → duty commands for PWM.
+        ◦ Clamp I_ref by thermal limits and battery current limit.
+    5. Adaptive phase probe (non-blocking):
+        ◦ Periodically trigger ±Δφ probes (ISR) when steady for N ms.
+        ◦ Apply ±Δφ, collect filtered torque proxy (e.g., mechanical power from speed * torque_est or current/tach surrogate), decide adjustment direction and nudge φ_target.
+        ◦ Maintain history and reduce probe amplitude as convergence reached.
+    6. Jitter prediction compensation:
+        ◦ If jitter/noise in phase is detected (via torque variance), reduce probe amplitude and increase averaging; optionally switch to more robust (3HB or 2HB) mode.
+    7. Mode switching logic:
+        ◦ Criteria: torque headroom, thermal margin, power demand.
+        ◦ If torque headroom low but thermal margin good → enable 3HB for finer control.
+        ◦ If thermal margin tight → 2HB (simpler phasing) or conservative current cap.
+    8. Telemetry & logging:
+        ◦ Stream CSV telemetry: θ_est, φ_target, I_phase, V_bus, T_motor, mode, torque_est — for off-board learning.
+Key practicalities:
+    • Torque measurement: if no torque sensor, use electrical proxy: T_est ≈ k_t * I_q (or sum of per-coil currents times a geometry factor). Combine with speed to compute mechanical power for efficiency estimates.
+    • Safety: saturate I_ref by min(I_bus_limit, thermal_limit), and implement watchdog that restores safe default if adaptive loop misbehaves.
+
+4) Hill climb → active probe pattern (practical dosing)
+You already use ±Δφ probes. Make them non-blocking and low duty so they don’t disturb the rider. Typical parameters:
+    • Probe amplitude Δφ = 0.01 – 0.1 rad (start larger, shrink on convergence)
+    • Dwell per side = 10–50 ms (depends on system time constant)
+    • Probe period = 0.5 – 2 s (less frequent during transients)
+    • Averaging window = 3–10 ms for torque proxy
+Decision rule: if torque_pos − torque_neg > threshold → adjust base_phase toward pos; else toward neg. Implement hysteresis + step attenuation.
+(You have the ISR FSM already — that is ideal.)
+
+5) Thermal & battery integration (practical rules)
+    • Set I_allowed = min(I_user_limit, I_bms_limit, I_thermal_limit).
+    • I_thermal_limit computed from simple RC thermal model or table: I_allowed = f(T_motor, coil_R, allowed_deltaT). Use graphoil/heatpipe improvements to change thermal resistance constant in that model.
+    • Aggressively reduce current for sustained high temps rather than short trips: favor dynamic derating vs binary cutoffs.
+    • If BMS reports cell imbalance or high cell temp, reduce regen aggressiveness and peak torque to protect pack.
+
+6) Implementation checklist (software + hardware) — quick practical steps
+Software (first 2–3 weeks of dev/cycling):
+    1. Implement refined hall interpolation + PLL observer.
+    2. Add current PI loops per coil and safe saturations.
+    3. Add DE5 setpoint-reading (CSV table) and mapping to φ_target.
+    4. Implement non-blocking probe FSM (ISR) for phase tuning.
+    5. Add telemetry logging (CSV) for offline analysis.
+Hardware (parallel):
+    1. Ensure accurate current sensing (low drift shunt + ADC).
+    2. Add motor temperature sensor (thermistor embedded in winding or thermocouple on housing).
+    3. Add thermal interface upgrades (graphite spreader + fins) if possible — cheap, big win.
+    4. Prefer GaN MOSFETs if budget allows; otherwise choose low-Rds(on) SiC or high-speed Si MOSFETs with low gate charge.
+Validation & test:
+    1. Bench test with dynamometer or steady load; log electrical/mechanical power and temperatures.
+    2. Run controlled phase sweep to build torque vs phase map.
+    3. Test probe convergence and stability under transients.
+    4. Field test on representative trip (compare energy/kWh and temperature).
+
+7) Metrics & experiments to quantify benefit
+Collect these on each run:
+    • Energy per trip (Wh)
+    • Average torque and torque per amp (Nm/A)
+    • Thermal curves (coil temp vs time)
+    • Peak and average current
+    • Efficiency = mechanical power / electrical power (use speed × torque_est)
+    • Range estimate difference for same route/profile
+Run A/B tests:
+    • Baseline stock controller vs QMD-enabled controller, same battery/cycle, multiple repeats.
+    • Two modes: energy-optimized (derated) and performance-optimized (higher peak but monitored thermals).
+
+8) Practical gotchas & safety
+    • QMD probe must be constrained: never exceed safe current during probes; always revert to safe base_phase if torque drops catastrophically.
+    • Do not rely solely on electrical proxies for torque in safety-critical scenarios — add conservative margins.
+    • Watch for EMI and measurement aliasing from switching; filter carefully but avoid latency that hides phase shifts.
+    • Ensure BMS and vehicle safety interlocks can override the QMD controller instantly.
+
+9) Concrete next steps I can produce for you (pick any, I’ll deliver straight away)
+    • MCU pseudocode + real ISR timings to embed the non-blocking probe and adaptive phase loop into your existing firmware.
+    • A Colab notebook that simulates hall-based rotor estimation + QMD probe convergence on a synthetic motor model so you can see expected energy/torque gains before hardware tests.
+    • A telemetry CSV format and analysis script to compute energy/efficiency/t_curl metrics from logged runs.
+    • Suggested parts list: current shunt, thermistor, graphoil sheet spec, candidate GaN MOSFET parts with comparable Rds(on)/Qg tradeoffs.
+
+10) Bottom line — practical ROI
+Given realistic constraints (3 Halls, shunt, motor temp, BMS bus telemetry), QMD-style control provides meaningful, practical efficiency gains by optimizing commutation timing and adapting to thermal and battery state. The single largest low-cost wins are: continuous phase optimization (probe), thermal-aware current limiting, and better PWM timing (dead-time compensation). Together with passive thermal upgrades and modest hardware improvements (accurate shunt, faster FETs when affordable), you can get tangible range and performance improvements without exotic sensors.
