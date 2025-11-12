@@ -1,0 +1,441 @@
+QMD for BLDC motor 9 (QMD + openesc code)
+
+
+#ifndef QMD_H
+#define QMD_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Basic types forwarded from FOC/sensor code (minimal)
+typedef struct {
+    float theta_elec;     // electrical rotor angle (rad)
+    float omega;          // rotor speed (rad/s)
+    float i_a, i_b, i_c;  // phase currents (A) - optional
+    float i_q, i_d;       // FOC currents (A)
+    float v_bus;          // bus voltage (V)
+    float temp_motor_C;   // motor temperature (C)
+} qmd_sensor_t;
+
+typedef struct {
+    float iq_ref;         // requested torque current
+    float id_ref;
+    float theta_cmd;      // commanded electrical angle before QMD correction
+} qmd_foc_state_t;
+
+// QMD configuration structure (tuneable)
+typedef struct {
+    float Kp_phase;       // PI for phase adapt (rad / proxy units)
+    float Ki_phase;       // integral gain
+    float max_phase_rad;  // clamp for phase correction (rad), e.g., 0.12 (~7 deg)
+    float probe_delta_rad;// probe amplitude for hill-climb (rad)
+    float probe_ms;       // probe duration in ms per half-step
+    float jitter_comp;    // jitter compensation factor [0..1]
+    float I_bus_limit_A;  // safe clamp for current integrator (A)
+    uint32_t telemetry_period_ms; // telemetry send period
+} qmd_config_t;
+
+// Modes
+typedef enum {
+    QMD_MODE_IDLE = 0,
+    QMD_MODE_OBSERVE,    // passive (no actuation) - log only
+    QMD_MODE_PROBE,      // active probe (dphi pulses)
+    QMD_MODE_ADAPT,      // adaptive phase-tracking loop active
+    QMD_MODE_LOCKED,     // locked to optimized value
+} qmd_mode_t;
+
+// Initialization
+void qmd_init(const qmd_config_t *cfg);
+
+// Main tick: call from control loop at fixed dt
+// dt_s: seconds since last call (float)
+// sensor: pointer to measured signals
+// foc: pointer to FOC setpoints; QMD will read and optionally write adjustments
+void qmd_tick(float dt_s, const qmd_sensor_t *sensor, qmd_foc_state_t *foc);
+
+// Retrieve current QMD outputs
+float qmd_get_phase_offset(void); // recommended angle offset (radians)
+float qmd_get_rt_proxy(void);     // current RT proxy value (float)
+
+// CAN interface handlers (call from your CAN RX path)
+void qmd_handle_can_rx(uint32_t msgid, const uint8_t *data, uint8_t len);
+
+// Telemetry send (calls your platform CAN send callback if registered)
+void qmd_send_telemetry(void);
+
+// Register platform callbacks (must be set before qmd_send_telemetry)
+typedef int (*qmd_can_send_fn)(uint32_t id, const uint8_t *data, uint8_t len);
+void qmd_register_can_send(qmd_can_send_fn fn);
+
+// Utility: load parameter row (from flash / CSV loader)
+bool qmd_load_param_row(uint8_t row_index);
+
+// Debug / status
+qmd_mode_t qmd_get_mode(void);
+void qmd_set_mode(qmd_mode_t m);
+
+#ifdef __cplusplus
+}
+#endif
+#endif // QMD_H
+
+// qmd.c content
+/* qmd.c
+ *
+ * QMD (DE5) integration module
+ * - RT proxy torque estimator
+ * - adaptive phase PI controller (non-blocking)
+ * - active probe (dphi pulses)
+ * - simple CAN command & telemetry hooks
+ *
+ * NOTE: Replace platform_can_send() placeholder with your firmware's CAN tx function.
+ *
+ * Author: QMD integration patch
+ */
+
+#include "qmd.h"
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+// -----------------------------------------------------------------------------
+// Platform hooks: set these to your platform CAN send function before using
+// -----------------------------------------------------------------------------
+static qmd_can_send_fn platform_can_send = 0;
+void qmd_register_can_send(qmd_can_send_fn fn) { platform_can_send = fn; }
+
+// -----------------------------------------------------------------------------
+// Default configuration
+// -----------------------------------------------------------------------------
+static qmd_config_t cfg_default = {
+    .Kp_phase = 0.6f,            // tune in-situ
+    .Ki_phase = 10.0f,           // tune in-situ (rad/(proxy*s))
+    .max_phase_rad = 0.18f,      // ~10 degrees
+    .probe_delta_rad = 0.035f,   // ~2 degrees
+    .probe_ms = 40.0f,
+    .jitter_comp = 0.9f,
+    .I_bus_limit_A = 250.0f,
+    .telemetry_period_ms = 100,
+};
+
+// Module state
+static qmd_config_t cfg;
+static qmd_mode_t mode = QMD_MODE_OBSERVE;
+
+// Internal state for PI controller
+static float phase_int = 0.0f;
+static float phase_cmd = 0.0f; // output of controller (radians)
+static float last_proxy = 0.0f;
+
+// Probe state machine
+typedef struct {
+    bool running;
+    uint32_t t_ms;         // ms counter in probe state
+    uint32_t half_ms;      // probe half period ms
+    float base_phase;      // base offset before probe
+    float best_phase;      // best found phase
+    float best_proxy;
+    int step;              // +1 or -1 probe currently applied
+} probe_state_t;
+static probe_state_t probe = {0};
+
+// Telemetry timer
+static uint32_t telemetry_accum_ms = 0;
+
+// -----------------------------------------------------------------------------
+// Simple RT (squared) proxy (analytical algebraic substitute for cos(theta))
+//    squared_proxy = (x^2 + 1 - y^2) / (2*x)  [example algebraic form]
+// We expose both float and integer-friendly routines.
+// NOTE: adapt proxy formula to your DE5 algebraic form.
+// -----------------------------------------------------------------------------
+
+// Example float RT proxy (replace with your DE5 algebraic expression)
+static float rt_proxy_float(float r_norm, float phi /*phase offset*/) {
+    // r_norm is a geometry normalization (0..1), phi is relative phase
+    // simple squared-torque proxy: (1/r_norm^2) * (1 - (phi/π)^2)  (toy)
+    // Use a numerically-stable algebraic expression — replace with your real DE5 proxy.
+    float a = (r_norm <= 0.0f) ? 1.0f : r_norm;
+    float z = 1.0f - (phi * phi) / (3.14159265f * 3.14159265f);
+    return (z / (a * a));
+}
+
+// 32.32 fixed-point squared proxy example (signed 64-bit intermediate)
+static int64_t fixed_mul_i64(int64_t a, int64_t b) {
+    // both a, b are Q32 fixed; product >>32 to return Q32
+    __int128_t tmp = (__int128_t)a * (__int128_t)b;
+    return (int64_t)(tmp >> 32);
+}
+
+// Convert float to Q32 and back helpers
+static inline int64_t float_to_q32(double v) { return (int64_t)(v * (double)(1ULL<<32)); }
+static inline double q32_to_double(int64_t q) { return ((double)q) / (double)(1ULL<<32); }
+
+// Example fixed-point RT proxy (Q32); returns Q32
+// Using toy algebraic formula analogous to rt_proxy_float
+static int64_t rt_proxy_fixed_q32(int64_t r_norm_q32, int64_t phi_q32) {
+    // z = 1 - (phi/pi)^2
+    const double PI = 3.141592653589793;
+    int64_t pi_q32 = float_to_q32(PI);
+    // compute phi/pi in Q32: (phi_q32 << 32) / pi_q32  -> we do as double for clarity
+    double phi = q32_to_double(phi_q32);
+    double rn = q32_to_double(r_norm_q32);
+    double z = 1.0 - (phi * phi) / (PI * PI);
+    double out = z / (rn * rn + 1e-12);
+    return float_to_q32(out);
+}
+
+// -----------------------------------------------------------------------------
+// Utility clamps
+// -----------------------------------------------------------------------------
+static inline float clampf(float v, float a, float b) {
+    if (v < a) return a;
+    if (v > b) return b;
+    return v;
+}
+
+// -----------------------------------------------------------------------------
+// Parameter table stub (flash) - fill with your DE5 rows or load from CSV
+// -----------------------------------------------------------------------------
+#define QMD_TABLE_ROWS 8
+typedef struct {
+    float r_norm;
+    float preferred_phase_rad;
+    float iq_pref;
+} qmd_row_t;
+
+static const qmd_row_t qmd_table[QMD_TABLE_ROWS] = {
+    {0.8f, 0.0f, 10.0f},
+    {0.9f, 0.02f, 12.0f},
+    {0.7f, -0.015f, 9.0f},
+    {0.95f, 0.035f, 14.0f},
+    {0.85f, -0.04f, 11.0f},
+    {0.75f, 0.01f, 10.5f},
+    {0.65f, -0.02f, 8.0f},
+    {0.88f, 0.0f, 13.0f}
+};
+static uint8_t qmd_row_selected = 0;
+
+// Load param row index into runtime config
+bool qmd_load_param_row(uint8_t row_index) {
+    if (row_index >= QMD_TABLE_ROWS) return false;
+    qmd_row_selected = row_index;
+    // could copy into runtime structure if needed
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// CAN IDs and payloads (simple examples) - choose IDs free in your system
+// -----------------------------------------------------------------------------
+#define QMD_CAN_CMD_ID   0x320
+#define QMD_CAN_TLM_ID   0x321
+
+// Command payload (byte[0]): cmd code
+// 0x01 - set mode (byte1=mode), 0x02 - set kp/ki (float32), 0x03 - load table row (byte1=index)
+// Telemetry payload: 8 bytes: [float rt_proxy][float phase_rad] (packed little-endian)
+
+// simple pack/unpack helpers for float <-> bytes
+static void pack_f32_le(uint8_t *dst, float v){
+    union { float f; uint8_t b[4]; } u;
+    u.f = v;
+    dst[0]=u.b[0]; dst[1]=u.b[1]; dst[2]=u.b[2]; dst[3]=u.b[3];
+}
+static float unpack_f32_le(const uint8_t *src){
+    union { float f; uint8_t b[4]; } u;
+    u.b[0]=src[0]; u.b[1]=src[1]; u.b[2]=src[2]; u.b[3]=src[3];
+    return u.f;
+}
+
+// -----------------------------------------------------------------------------
+// Public API: init
+// -----------------------------------------------------------------------------
+void qmd_init(const qmd_config_t *cfg_in) {
+    if (cfg_in) {
+        memcpy(&cfg, cfg_in, sizeof(cfg));
+    } else {
+        memcpy(&cfg, &cfg_default, sizeof(cfg));
+    }
+    mode = QMD_MODE_OBSERVE;
+    phase_int = 0.0f;
+    phase_cmd = 0.0f;
+    last_proxy = 0.0f;
+    probe.running = false;
+    telemetry_accum_ms = 0;
+}
+
+// -----------------------------------------------------------------------------
+// getters
+// -----------------------------------------------------------------------------
+qmd_mode_t qmd_get_mode(void) { return mode; }
+void qmd_set_mode(qmd_mode_t m) {
+    if (m == QMD_MODE_PROBE) {
+        // initialize probe
+        probe.running = true;
+        probe.t_ms = 0;
+        probe.half_ms = (uint32_t)(cfg.probe_ms);
+        probe.base_phase = phase_cmd;
+        probe.best_phase = phase_cmd;
+        probe.best_proxy = -1e30f;
+        probe.step = 1;
+    } else {
+        probe.running = false;
+    }
+    mode = m;
+}
+
+float qmd_get_phase_offset(void) {
+    // clamp
+    return clampf(phase_cmd, -cfg.max_phase_rad, cfg.max_phase_rad);
+}
+float qmd_get_rt_proxy(void) { return last_proxy; }
+
+// -----------------------------------------------------------------------------
+// Telemetry send (non-blocking wrapper, expects platform_can_send hooked up)
+// -----------------------------------------------------------------------------
+void qmd_send_telemetry(void) {
+    if (!platform_can_send) return;
+    uint8_t buf[8];
+    pack_f32_le(&buf[0], last_proxy);
+    pack_f32_le(&buf[4], phase_cmd);
+    platform_can_send(QMD_CAN_TLM_ID, buf, 8);
+}
+
+// -----------------------------------------------------------------------------
+// CAN RX handler (simple command parser)
+// -----------------------------------------------------------------------------
+void qmd_handle_can_rx(uint32_t msgid, const uint8_t *data, uint8_t len) {
+    if (msgid != QMD_CAN_CMD_ID || len < 1) return;
+    uint8_t cmd = data[0];
+    switch (cmd) {
+        case 0x01: // set mode
+            if (len >= 2) {
+                uint8_t m = data[1];
+                if (m <= QMD_MODE_LOCKED) qmd_set_mode((qmd_mode_t)m);
+            }
+            break;
+        case 0x02: // set kp,ki (float32, float32)
+            if (len >= 8) {
+                float kp = unpack_f32_le(&data[1]);
+                float ki = unpack_f32_le(&data[5]);
+                cfg.Kp_phase = kp;
+                cfg.Ki_phase = ki;
+            }
+            break;
+        case 0x03: // load table row
+            if (len >= 2) {
+                uint8_t idx = data[1];
+                qmd_load_param_row(idx);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// probe apply: non-blocking probe state machine that toggles dphi
+// -----------------------------------------------------------------------------
+static void probe_step_ms(uint32_t dt_ms) {
+    if (!probe.running) return;
+    probe.t_ms += dt_ms;
+    if (probe.t_ms >= probe.half_ms) {
+        // switch half-step
+        probe.t_ms = 0;
+        probe.step = -probe.step;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// de5_setpoints_for_phase: produce current setpoints for a given phase offset
+// -----------------------------------------------------------------------------
+static float de5_setpoints_for_phase(const qmd_sensor_t *sensor, float phase_offset) {
+    // Use the parameter table row and the proxy to compute a scalar "proxy" value of effectiveness
+    const qmd_row_t *row = &qmd_table[qmd_row_selected];
+    float rnorm = row->r_norm;
+    // compute RT-proxy (float)
+    float proxy = rt_proxy_float(rnorm, phase_offset);
+    (void)sensor; // currently not used; extend to use currents/temps
+    return proxy;
+}
+
+// -----------------------------------------------------------------------------
+// qmd_tick: main loop. dt_s seconds since last update.
+// -----------------------------------------------------------------------------
+void qmd_tick(float dt_s, const qmd_sensor_t *sensor, qmd_foc_state_t *foc) {
+    if (!sensor || !foc) return;
+    // compute current probe/time step in ms
+    uint32_t dt_ms = (uint32_t)(dt_s * 1000.0f + 0.5f);
+    telemetry_accum_ms += dt_ms;
+
+    // 1) compute current RT proxy at small perturbations around current phase_cmd
+    //    we evaluate at base, +probe_delta, -probe_delta for hill-climb / gradient estimate
+    float base_phase = phase_cmd;
+    float p_base = de5_setpoints_for_phase(sensor, base_phase);
+    float p_plus = de5_setpoints_for_phase(sensor, base_phase + cfg.probe_delta_rad);
+    float p_minus = de5_setpoints_for_phase(sensor, base_phase - cfg.probe_delta_rad);
+    last_proxy = p_base;
+
+    // 2) If probe mode, run non-blocking probe state machine and update best found
+    if (mode == QMD_MODE_PROBE && probe.running) {
+        probe_step_ms(dt_ms);
+        // current applied delta based on probe.step
+        float applied = (probe.step > 0) ? cfg.probe_delta_rad : -cfg.probe_delta_rad;
+        float measured = de5_setpoints_for_phase(sensor, base_phase + applied);
+        // record best
+        if (measured > probe.best_proxy) {
+            probe.best_proxy = measured;
+            probe.best_phase = base_phase + applied;
+        }
+        // after some global criterion (e.g., probe_run_count or external stop), transition
+        // For safety here we use a simple time budget: after N half-steps we stop (not implemented).
+        // update phase_cmd to best found so far
+        phase_cmd = probe.best_phase;
+    }
+
+    // 3) If adaptive mode, estimate gradient and run PI
+    if (mode == QMD_MODE_ADAPT) {
+        // numerical gradient estimate
+        float grad = (p_plus - p_minus) / (2.0f * cfg.probe_delta_rad + 1e-12f);
+        // desired change in phase proportional to gradient
+        float phase_err = grad; // positive grad => move +phase to increase proxy
+        // PI update
+        phase_int += phase_err * cfg.Ki_phase * dt_s;
+        float u = cfg.Kp_phase * phase_err + phase_int;
+        // apply jitter compensation (dampen noisy fluctuations)
+        u *= cfg.jitter_comp;
+        // integrate into command
+        phase_cmd += u * dt_s;
+        // clamp
+        phase_cmd = clampf(phase_cmd, -cfg.max_phase_rad, cfg.max_phase_rad);
+    }
+
+    // 4) If locked mode, do nothing (phase_cmd remains constant)
+    // 5) If observe mode, optionally compute a small reference adjustment (not applied)
+    if (mode == QMD_MODE_OBSERVE) {
+        // simple slowly drifting estimator toward table suggested phase
+        const qmd_row_t *row = &qmd_table[qmd_row_selected];
+        float target = row->preferred_phase_rad;
+        float blend = 0.01f; // slow drift per tick
+        phase_cmd = (1.0f - blend) * phase_cmd + blend * target;
+    }
+
+    // 6) apply safe clamp to phase_cmd
+    phase_cmd = clampf(phase_cmd, -cfg.max_phase_rad, cfg.max_phase_rad);
+
+    // 7) Optionally modify foc setpoints (safe advisory interface)
+    //    We do not override current command; instead we propose adjustments:
+    //    If you want QMD to influence iq_ref: uncomment next line (careful!)
+    // foc->iq_ref = clampf(foc->iq_ref + 0.0f, -cfg.I_bus_limit_A, cfg.I_bus_limit_A);
+
+    // 8) Telemetry send
+    if (telemetry_accum_ms >= cfg.telemetry_period_ms) {
+        telemetry_accum_ms = 0;
+        qmd_send_telemetry();
+    }
+}
+
+// -----------------------------------------------------------------------------
+/* End of qmd.c */
