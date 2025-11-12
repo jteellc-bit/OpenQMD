@@ -1,0 +1,99 @@
+Gift for openESC 2 (code)
+
+Code:
+
+
+%%bash
+# ============================================================
+# OpenESC vs RT Rational Proxy (Micro-Benchmark)
+# ============================================================
+
+cat <<'EOF' > rt_openesc_vs_rt_proxy_micro.c
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <time.h>
+#include <math.h>
+#include <stdlib.h>
+
+typedef int64_t q32_t;
+
+#define Q32_ONE  ((int64_t)1 << 32)
+#define Q32_FROM_FLOAT(x) ((int64_t)((x) * (double)Q32_ONE))
+#define Q32_TO_FLOAT(x)   ((double)(x) / (double)Q32_ONE)
+
+// --- Q32 Multiply ---
+static inline q32_t q32_mul(q32_t a, q32_t b) {
+    __int128_t tmp = (__int128_t)a * (__int128_t)b;
+    return (q32_t)(tmp >> 32);
+}
+
+// --- RT Rational Proxy: Purely Algebraic 1 - x^2 ---
+static inline q32_t rt_quadratic_proxy_q32(q32_t x_q32) {
+    __int128_t x_sq_q64 = (__int128_t)x_q32 * (__int128_t)x_q32;
+    q32_t x_sq_q32 = (q32_t)(x_sq_q64 >> 32);
+    return Q32_ONE - x_sq_q32;
+}
+
+int main(void) {
+    const int N_SAMPLES = 1000000;
+    const double x_min = -1.0, x_max = 1.0;
+    const double step = (x_max - x_min) / (N_SAMPLES - 1);
+
+    float acc_cosf = 0.0f;
+    q32_t acc_proxy = 0;
+
+    // Precompute x arrays
+    float *x_float = malloc(N_SAMPLES * sizeof(float));
+    q32_t *x_q32   = malloc(N_SAMPLES * sizeof(q32_t));
+    for (int i = 0; i < N_SAMPLES; ++i) {
+        double x = x_min + i * step;
+        x_float[i] = (float)x;
+        x_q32[i]   = Q32_FROM_FLOAT(x);
+    }
+
+    struct timespec t0, t1;
+    double elapsed_cosf, elapsed_proxy;
+
+    // ------------------------------------------------------------
+    // Benchmark OpenESC (float mathf)
+    // ------------------------------------------------------------
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < N_SAMPLES; ++i)
+        acc_cosf += cosf(x_float[i]);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    elapsed_cosf = (t1.tv_sec - t0.tv_sec)*1e9 + (t1.tv_nsec - t0.tv_nsec);
+
+    // ------------------------------------------------------------
+    // Benchmark RT Rational Proxy (pure fixed-point)
+    // ------------------------------------------------------------
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < N_SAMPLES; ++i)
+        acc_proxy += rt_quadratic_proxy_q32(x_q32[i]);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    elapsed_proxy = (t1.tv_sec - t0.tv_sec)*1e9 + (t1.tv_nsec - t0.tv_nsec);
+
+    // ------------------------------------------------------------
+    // Results
+    // ------------------------------------------------------------
+    printf("\n=== OpenESC vs RT Rational Proxy (Micro-Benchmark) ===\n");
+    printf("Samples: %d\n", N_SAMPLES);
+    printf("--------------------------------------------\n");
+    printf("Function        | Total (ms) | ns/call | Accumulator\n");
+    printf("--------------------------------------------\n");
+    printf("cosf (OpenESC)  | %8.3f | %7.3f | %.1f\n",
+           elapsed_cosf / 1e6, elapsed_cosf / N_SAMPLES, acc_cosf);
+    printf("RT Proxy (1-x²) | %8.3f | %7.3f | %" PRId64 "\n",
+           elapsed_proxy / 1e6, elapsed_proxy / N_SAMPLES, (int64_t)acc_proxy);
+    printf("--------------------------------------------\n");
+
+    free(x_float);
+    free(x_q32);
+    return 0;
+}
+EOF
+
+# --- Compile & Run ---
+gcc -O3 -std=c11 rt_openesc_vs_rt_proxy_micro.c -lm -o rt_openesc_vs_rt_proxy_micro
+./rt_openesc_vs_rt_proxy_micro

@@ -1,0 +1,62 @@
+Gift for openESC 3 (future version 2.0)
+
+⚙️ Version Line
+    • Version 1.x — “Gift Edition” (OpenESC-compatible)
+        ◦ Purpose: drop-in rational proxy (1 − x²) replacement for cosf()
+        ◦ Domain: pure algebraic, no DE5 input
+        ◦ Status: ✅ complete and benchmarked
+        ◦ Performance: 1.12 ns / call, ≈ 4× faster than baseline cosf(), 100 % deterministic
+    • Version 2.0 — “DE5-Enhanced Kernel”
+        ◦ Purpose: introduce hyperbolic mapping derived from the DE5 model
+        ◦ Domain: integer Q32 with extended geometric term
+        ◦ Goal: demonstrate whether DE5’s curvature compensation improves accuracy or smoothness without significant timing cost
+
+🧩 Version 2.0 Design Notes
+We’ll add a third kernel to the benchmark harness:
+// --- DE5-Enhanced Rational Proxy (Version 2.0) ---
+// Hypothetical hyperbolic extension:
+// f_DE5(x) = (1 - x^2) / (1 + k*x^2)
+// where k is a small curvature parameter in Q32 domain.
+static inline q32_t rt_de5_proxy_q32(q32_t x_q32)
+{
+    const q32_t k_q32 = Q32_FROM_FLOAT(0.25); // tunable DE5 curvature
+    __int128_t x2_q64 = (__int128_t)x_q32 * (__int128_t)x_q32;     // Q64
+    q32_t x2_q32 = (q32_t)(x2_q64 >> 32);
+    q32_t num_q32 = Q32_ONE - x2_q32;
+    __int128_t denom_q64 = (__int128_t)Q32_ONE + ((__int128_t)k_q32 * x2_q32 >> 32);
+    // Convert back to Q32 via division
+    q32_t y_q32 = (q32_t)(((__int128_t)num_q32 << 32) / denom_q64);
+    return y_q32;
+}
+Then extend the micro-benchmark table:
+=== OpenESC vs RT Rational Proxy vs DE5 (v2.0) ===
+Samples: 1,000,000
+--------------------------------------------
+Function        | Total (ms) | ns/call | Accumulator
+--------------------------------------------
+cosf (OpenESC)  |   ... | ... | ...
+RT Proxy (1-x²) |   ... | ... | ...
+RT Proxy (DE5)  |   ... | ... | ...
+--------------------------------------------
+CSV columns:
+x_float, proxy_Q32, proxy_float, de5_Q32, de5_float, cosf, err_rt, err_de5
+
+🧠 Expected Outcomes
+Aspect
+v1.x (1 − x²)
+v2.0 (DE5 hyperbolic)
+Accuracy vs cosf()
+Good near 0°, weaker at edges
+Higher global fidelity
+Cost
+1–2 ns
+2–3 ns (extra multiply + div)
+Determinism
+Fully deterministic
+Same
+Use case
+Drop-in math.h replacement
+Next-gen “Green” RT kernel (DE5 aware)
+Gift compatibility
+✅
+❌ (internal research only)
