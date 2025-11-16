@@ -1,0 +1,79 @@
+QMD v3.0 (summary)
+
+
+1) Plain-text CSV (single table — QMD v3.0 summary)
+group_key,group_value,controller,kernel_impl,Vbus,trig_type,tau_cmd,qbits,pwm_bits,efficiency_pct,ns_per_call,eff_delta_vs_baseline_pct
+best_per_voltage,48,DE5_QFOC,algebraic,48,exact,1,24,8,88.343675,1500,20.033089
+best_per_voltage,84,DE5_QFOC,algebraic,84,exact,1,24,8,95.411168,1500,23.001947
+best_per_voltage,120,DE5_QFOC,algebraic,120,exact,1,24,8,95.411168,1500,23.001947
+best_per_qbit,24,DE5_QFOC,algebraic,84,exact,1,24,8,95.411168,1500,23.001947
+best_per_qbit,32,DE5_QFOC,algebraic,84,exact,1,32,8,95.411168,1470.095498,23.001947
+best_per_qbit,40,DE5_QFOC,algebraic,84,exact,1,40,8,95.411168,1447.310946,23.001947
+best_per_pwm,8,DE5_QFOC,algebraic,84,exact,1,24,8,95.411168,1500,23.001947
+best_per_pwm,10,DE5_QFOC,algebraic,84,exact,1,24,10,95.411168,1510.075145,23.001947
+best_per_pwm,12,DE5_QFOC,algebraic,84,exact,1,24,12,95.411168,1518.357353,23.001947
+Notes on the CSV:
+    • efficiency_pct and eff_delta_vs_baseline_pct come from the summary block you pasted.
+    • ns_per_call is the measured kernel-call-equivalent time from the run summary rows.
+    • The “best” rows are the exact summary lines: best per voltage, per qbit, per pwm as shown.
+
+2) Compact Markdown writeup (README-ready, ~1–2 pages)
+# QMD v3.0 — Summary & Interpretation
+
+## Executive summary
+- This report summarizes the QMD v3.0 A/B sweep results (DE5-QFOC controller, algebraic vs physics kernels, multiple voltages and kernel implementations).
+- The single best configuration observed in the sweep (by several groupings) is **DE5_QFOC with the algebraic DE5 kernel**, particularly at **Vbus = 84 V**, yielding **~95.41% efficiency** in the exact-trig test cases and consistently low ns_per_call in the reported best cases.
+- For Vbus = 48 V the top observed efficiency (algebraic) is lower (~88.34%). For Vbus = 84 V and 120 V the reported top-case efficiency is ~95.41%.
+
+---
+
+## Plain results (high level)
+- **Best per voltage**
+  - 48 V: DE5_QFOC (algebraic) — **88.343675%**, ns_per_call = 1500, eff delta vs baseline = 20.033089%
+  - 84 V: DE5_QFOC (algebraic) — **95.411168%**, ns_per_call = 1500, eff delta vs baseline = 23.001947%
+  - 120 V: DE5_QFOC (algebraic) — **95.411168%**, ns_per_call = 1500, eff delta vs baseline = 23.001947%
+
+- **Best per qbit**
+  - qbits = 24: DE5_QFOC (algebraic) at 84 V — **95.411168%**, ns_per_call = 1500
+  - qbits = 32: DE5_QFOC (algebraic) at 84 V — **95.411168%**, ns_per_call = 1470.095498
+  - qbits = 40: DE5_QFOC (algebraic) at 84 V — **95.411168%**, ns_per_call = 1447.310946
+
+- **Best per pwm_bits**
+  - pwm = 8: DE5_QFOC (algebraic) at 84 V — **95.411168%**, ns_per_call = 1500
+  - pwm =10: same eff; ns_per_call = 1510.075145
+  - pwm =12: same eff; ns_per_call = 1518.357353
+
+Note: `eff_delta_vs_baseline_pct` values reported in the run indicate the relative improvement over the baseline configuration used in the sweep.
+
+---
+
+## Interpretation & takeaways
+1. **Algebraic DE5 kernel is the clear top performer** in the reported sweep: it produces the top absolute efficiencies (≈95.41%) at mid-to-high bus voltages (84–120 V) while maintaining computational cost in the measured ns_per_call band. The physics kernel remains valuable as a slower, exact verification/reference, but the algebraic approach is superior for runtime use in many cases.
+
+2. **Voltage sensitivity** — the same algebraic kernel delivers different peak efficiencies at different Vbus:
+   - At **48 V** the best observed efficiency is noticeably lower (~88.34%). This suggests the torque/power operating point + motor/controller tuning interacts strongly with available voltage. Additional tuning (gain maps, current limits, electrical timing) is recommended for low-V operation.
+
+3. **Qbits and PWM: diminishing returns** — the best efficiencies appear consistent across qbit levels (24/32/40) for the best algebraic case; the main effect of qbits is on `ns_per_call` (runtime cost). This suggests the algebraic kernel’s accuracy is robust across quantization depths while compute cost varies predictably.
+
+4. **Performance vs complexity tradeoff** — `ns_per_call` shows a measurable spread across kernels and configurations. Use these numbers to pick the kernel that fits your hardware execution budget. The algebraic kernel balances accuracy and performance; physics kernel should be used for ground-truth validation or offline fitting.
+
+---
+
+## Recommendations (practical next steps)
+1. **Lock the algebraic DE5 kernel as default** in the real-time stack for 84 V class controllers (Fardriver equivalents), while keeping the physics kernel available as a verification path for regression tests.
+2. **Tune for low-voltage (48 V) operation** — run sweep variants that tune Kt/Ke, load torque and control gains specifically for 48 V bus to see if the ~88% ceiling can be pushed upward.
+3. **Adopt a perf/accuracy policy** — use qbits=24 (or lowest qbits that meets accuracy needs) on embedded controllers to reduce ns_per_call but maintain near-peak efficiency. When profiling suggests spare compute, consider increasing qbits.
+4. **Add CI regression** — add a small automated job that runs the algebraic vs physics kernels on a handful of representative cases to prevent regressions in efficiency or numeric stability.
+5. **Document canonical configs** — copy the best-per-voltage/qbit/pwm tuples into an official `configs/` directory for reproducible testing and deployment (QMD v3.0 canonical configs).
+
+---
+
+## Quick action items (short)
+- (A) Confirm the canonical deploy config: `DE5_QFOC / algebraic / V=84 / q=24 / pwm=8`.
+- (B) Run a focused low-V tuning sweep for 48 V to attempt to close the performance gap.
+- (C) Add the algebraic kernel to the firmware build matrix; keep physics for offline validation.
+
+---
+
+## Closing note
+These are the in-run numerical findings from the most recent A/B sweep. If you want a more detailed table (full per-case CSV inline), I can paste the full 486-row CSV content here — but I didn’t dump it by default to keep this summary compact. Tell me if you want the full raw table inline next.
