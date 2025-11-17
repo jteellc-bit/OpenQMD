@@ -1,0 +1,85 @@
+QMD-4.0 — 1  (Quick Model Derivation) 
+
+
+QMD-4.0 — Quick Model Derivation (Fourth Generation)
+QMD-4.0 is the fourth major refinement of the Quick Model Derivation framework: a fast, deterministic method for converting empirical system behavior into lightweight algebraic models suitable for microcontrollers, embedded control, and high-speed simulation.
+QMD-4.0 focuses on three goals:
+    1. Zero-dependency derivation
+Every stage of QMD-4.0 can be executed without external data, large solvers, or heavy toolchains.
+    2. Algebraic equivalence to the physical model
+The output model is a compact symbolic form that exactly reproduces the chosen baseline behavior.
+    3. Real-time deployability
+Each model produced by QMD-4.0 can be compiled into a float-only, branch-free, no-math.h C implementation.
+
+What’s New in 4.0?
+1. Unified Algebraic Core
+QMD-4.0 replaces all integrators, surrogate lookups, and iterative fitting with a closed-form polynomial efficiency model.
+This guarantees:
+    • deterministic evaluation
+    • microcontroller compatibility
+    • reproducible coefficients across Python and C
+This is the first QMD version that supports complete equivalence across all languages.
+
+2. State Transition Kernel (STK)
+QMD-4.0 introduces the STK, a minimal layer that converts physical inputs
+(q, pwm, τ)
+into a stable model state and defines how that state transitions under constructive or destructive interference.
+STK is the mathematical “bridge” that allows the algebraic DE5 core to participate in higher-order QMD behavior.
+
+3. Constructive / Destructive Symmetry
+QMD-4.0 formalizes a long-observed phenomenon first seen in QMD-2.0 test sweeps:
+    • Some input combinations amplify system output (“constructive states”)
+    • Others attenuate it (“destructive states”)
+QMD-4.0 encodes this through a signed gradient rule that is independent of the underlying physical system.
+This symmetry model becomes essential in multi-axis or multi-controller systems.
+
+4. Calibration-Ready Architecture
+QMD-4.0 includes a fully integrated workflow:
+    • generate synthetic baselines
+    • produce calibrated coefficients
+    • generate C + header
+    • generate Python reference
+    • run smoke tests
+    • verify cross-language equivalence
+All with one script and zero external files.
+
+5. Backward Compatibility
+While QMD-1.x, 2.x, and 3.x used different forms (lookup tables, mixed derivative layers, surrogate integrators), QMD-4.0 maintains:
+    • identical interface
+    • identical baseline behavior (after calibration)
+    • regression-test compatibility with previous reports
+This ensures that modernized QMD-4.0 models seamlessly drop into existing pipelines.
+
+How QMD-4.0 Works (Conceptual Overview)
+Step 1 — Select or Generate a Baseline
+A baseline describes “the system we want to reproduce.”
+QMD-4.0 allows:
+    • measured data
+    • synthetic data
+    • prior QMD outputs (e.g., QMD-3.0)
+Step 2 — Algebraic Derivation
+The DE5 core polynomial is fitted to the baseline using a constrained, deterministic method that guarantees smooth, monotonic behavior and microcontroller safety.
+Output:
+A complete set of coefficients producing the desired efficiency curve.
+Step 3 — Constructive/Destructive State Assignment
+Each point in the domain is labeled according to its signed gradient characteristics.
+This enables higher-order reasoning (e.g., stability analysis, interference prediction).
+Step 4 — Model Export
+QMD-4.0 generates:
+    • *.c and *.h microcontroller files
+    • a pure-Python mirror
+    • smoke-test verification and regression tests
+    • optional CSV manifests
+All artifacts are guaranteed consistent.
+
+Why QMD-4.0 Exists
+Traditional empirical modeling workflows require:
+    • large datasets
+    • nonlinear solvers
+    • numerical integration
+    • platform-specific code
+QMD-4.0 removes all of that.
+The entire system can be regenerated from scratch in seconds, produces deterministic algebraic models, and supports deployment onto extremely constrained embedded devices.
+
+One-Sentence Summary
+QMD-4.0 is a deterministic, algebraic modeling pipeline that can fully describe a complex system using only a compact polynomial, a symmetry rule, and a lightweight state-transition kernel — all deployable on a float-only microcontroller.
