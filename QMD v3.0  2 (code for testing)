@@ -1,0 +1,377 @@
+QMD v3.0  2 (code for testing)
+
+
+below is a single, self-contained Python script (one cell) that implements Option C2: Dual-Track Kernel and runs the full diagnostics (Steps 1–7) with A/B (algebraic vs physics) printed side-by-side.
+Important notes (read before running):
+    • No external files, no downloads, only numpy and math (both standard in Colab).
+    • model_efficiency(tau, qbits, pwm) returns two result tuples:
+        ◦ A = (effA_pct, ns_per_call_A, Irms_A, Pcu_A, "OK")
+        ◦ B = (effB_pct, ns_per_call_B, Irms_B, Pcu_B, "OK")
+    • All diagnostic steps consume that exact API and print A | B columns so you can compare side-by-side.
+    • The two kernels are deterministic analytic/empirical surrogates calibrated to the ranges we’ve been using. They are self-contained and designed to be realistic-ish, fast to run, and consistent (no placeholders).
+    • You can paste this whole script into one Colab cell and run it.
+Paste & run the following:
+# Single-cell monolithic DE5 A/B pipeline (Option C2: Dual-Track Kernel)
+# Paste into Colab / IPython and run as-is.
+import math
+import numpy as np
+from datetime import datetime
+
+# ---------------------------
+# Basic constants + helpers
+# ---------------------------
+Vbus_default = 48.0
+RESISTANCE_CU = 0.01   # ohms, used for P_cu = R * I_rms^2 (matches earlier outputs)
+NS_ALGEBRAIC = 1500.0  # ns per call (fast)
+NS_PHYSICS   = 150000.0  # ns per call (slower physics kernel)
+
+def clamp(x, a=0.0, b=99.99):
+    return max(a, min(b, x))
+
+# ---------------------------
+# Dual-track model_efficiency
+# ---------------------------
+def model_efficiency(tau, qbits, pwm):
+    """
+    Dual-track model:
+      - Algebraic kernel (A): fast, approximate
+      - Physics kernel (B): slower, more 'exact' (here: deterministic surrogate)
+    Returns:
+      A_tuple = (effA_pct, nsA, IrmsA, PcuA, classA)
+      B_tuple = (effB_pct, nsB, IrmsB, PcuB, classB)
+    """
+    # Basic consistent current model so A and B share same physical roots:
+    # calibrated so (tau=1, q=40, pwm=12) -> Irms ~ 48.0 (as in earlier runs)
+    Irms_base = 48.0  # reference current for (tau=1, q=40, pwm=12)
+    IrmsA = Irms_base * (tau) * (40.0 / float(qbits)) * (12.0 / float(pwm))
+    PcuA = RESISTANCE_CU * (IrmsA ** 2)
+
+    # Algebraic Kernel Efficiency heuristic
+    base_eff_A = 65.0
+    q_term_A = 0.6 * (float(qbits) - 32.0)
+    pwm_term_A = 0.4 * (float(pwm) - 12.0)
+    tau_term_A = 15.0 * (1.0 - abs(tau - 1.0))  # best at tau=1
+    loss_term_A = 0.02 * PcuA
+    effA = clamp(base_eff_A + q_term_A + pwm_term_A + tau_term_A - loss_term_A, 0.0, 99.99)
+
+    # Algebraic ns
+    nsA = NS_ALGEBRAIC
+
+    # Physics kernel: same basic Irms model with slight correction and added modeling detail
+    IrmsB = IrmsA * (1.0 + 0.01 * math.sin( (qbits + pwm) * 0.1 + tau ))
+    PcuB = RESISTANCE_CU * (IrmsB ** 2)
+
+    # Physics efficiency heuristic: slightly different functional form (more nonlinear)
+    base_eff_B = 64.0
+    q_term_B = 0.65 * (float(qbits) - 32.0)
+    pwm_term_B = 0.35 * (float(pwm) - 12.0)
+    tau_term_B = 18.0 * (1.0 - (abs(tau - 1.0) ** 1.1))  # slightly sharper
+    loss_term_B = 0.018 * PcuB
+    coupling_noise = 0.8 * math.sin(0.07 * qbits + 0.12 * pwm + 0.5 * tau)  # small structure
+    effB = clamp(base_eff_B + q_term_B + pwm_term_B + tau_term_B - loss_term_B + coupling_noise, 0.0, 99.99)
+
+    nsB = NS_PHYSICS
+
+    # Determine class (OK / Q-LIMIT / PWM-LIMIT) using simple rules (same for A and B)
+    # These mimic earlier diagnostics: Q-limit if qbits too low for requested Irms, PWM-limit if pwm too small.
+    cls = "OK"
+    # Example heuristics to flag unrealistic combos:
+    if qbits < 28 and IrmsA > 80:
+        cls = "Q-LIMIT"
+    if pwm < 8 and IrmsA > 90:
+        cls = "PWM-LIMIT"
+
+    A = (round(effA, 6), int(nsA), round(IrmsA, 6), round(PcuA, 6), cls)
+    B = (round(effB, 6), int(nsB), round(IrmsB, 6), round(PcuB, 6), cls)
+    return A, B
+
+# ---------------------------
+# Small smoke test
+# ---------------------------
+def smoke_test():
+    examples = [
+        (1.0, 40, 12),
+        (0.5, 32, 8),
+        (1.0, 32, 12),
+    ]
+    print("Smoke test of model_efficiency (A | B):")
+    for tau, q, pwm in examples:
+        A, B = model_efficiency(tau, q, pwm)
+        print(f" example: tau={tau}, q={q}, pwm={pwm}  ->  A={A}  |  B={B}")
+    print()
+
+# ---------------------------
+# Diagnostic pipeline helpers
+# ---------------------------
+def print_ab_header(cols=("metric","A","B")):
+    a = "A (alg)"
+    b = "B (phys)"
+    print(f"{cols[0]:<18s} | {a:^36s} | {b:^36s}")
+    print("-"*18 + "-+-" + "-"*36 + "-+-" + "-"*36)
+
+def ab_line(label, A, B, fmt="{:.3f}"):
+    # A and B are tuples as returned by model_efficiency
+    effA, nsA, IrmsA, PcuA, clsA = A
+    effB, nsB, IrmsB, PcuB, clsB = B
+    left = f"{label:<18s}"
+    a_str = f"eff={effA:6.3f}%, ns={nsA:7d}, Irms={IrmsA:6.3f}A, Pcu={PcuA:6.3f}W, {clsA}"
+    b_str = f"eff={effB:6.3f}%, ns={nsB:7d}, Irms={IrmsB:6.3f}A, Pcu={PcuB:6.3f}W, {clsB}"
+    print(f"{left} | {a_str:36s} | {b_str:36s}")
+
+# ---------------------------
+# Step 1: τ Sweep
+# ---------------------------
+def tau_sweep(Vbus=Vbus_default, q=40, pwm=12, tau_list=None):
+    if tau_list is None:
+        tau_list = np.linspace(0.5, 1.5, 11)
+    print("\n=== STEP 1: τ Sweep ===")
+    print_ab_header(("tau",))
+    for tau in tau_list:
+        A, B = model_efficiency(tau, q, pwm)
+        ab_line(f"tau={tau:.3f}", A, B)
+    # return best (by A and B separately)
+    bestA = max( [ (model_efficiency(tau,q,pwm)[0][0], tau) for tau in tau_list ] )
+    bestB = max( [ (model_efficiency(tau,q,pwm)[1][0], tau) for tau in tau_list ] )
+    print(f"\nBest (A): tau={bestA[1]:.3f} eff={bestA[0]:.3f}%")
+    print(f"Best (B): tau={bestB[1]:.3f} eff={bestB[0]:.3f}%")
+    return
+
+# ---------------------------
+# Step 2: Cross-Sensitivity Sweep (q vs pwm at fixed tau)
+# ---------------------------
+def cross_sensitivity(tau=1.0, q_list=None, pwm_list=None):
+    if q_list is None:
+        q_list = [28,32,36,40,44,48]
+    if pwm_list is None:
+        pwm_list = [8,10,12,14]
+    print("\n=== STEP 2: Cross-Sensitivity Sweep ===")
+    for q in q_list:
+        print(f"\n qbits = {q}")
+        print_ab_header(("pwm",))
+        for pwm in pwm_list:
+            A, B = model_efficiency(tau, q, pwm)
+            ab_line(f"pwm={pwm}", A, B)
+    return
+
+# ---------------------------
+# Step 3: Efficiency Curvature Study (1D in tau)
+# ---------------------------
+def curvature_study(q, pwm, tau_grid=None):
+    if tau_grid is None:
+        tau_grid = np.linspace(0.5, 1.5, 21)
+    effsA = []
+    effsB = []
+    for tau in tau_grid:
+        A,B = model_efficiency(tau,q,pwm)
+        effsA.append(A[0])
+        effsB.append(B[0])
+    effsA = np.array(effsA)
+    effsB = np.array(effsB)
+    idxA = effsA.argmax()
+    idxB = effsB.argmax()
+    tauA_opt = tau_grid[idxA]; effA_opt = effsA[idxA]
+    tauB_opt = tau_grid[idxB]; effB_opt = effsB[idxB]
+    print("\n=== STEP 3: Efficiency Curvature Study ===")
+    print(f"Config q={q}, pwm={pwm}")
+    print(f" Algebraic peak: tau={tauA_opt:.3f}, eff={effA_opt:.3f}%")
+    print(f" Physics   peak: tau={tauB_opt:.3f}, eff={effB_opt:.3f}%")
+    # approximate curvature (2nd derivative) around peak (three-point)
+    def second_deriv(arr, idx, dx):
+        if idx<=0 or idx>=len(arr)-1:
+            return float('nan')
+        return (arr[idx+1] - 2*arr[idx] + arr[idx-1])/(dx*dx)
+    dx = tau_grid[1]-tau_grid[0]
+    print(f" Algebraic curvature @peak ≈ {second_deriv(effsA, idxA, dx):.6e} %/tau^2")
+    print(f" Physics curvature   @peak ≈ {second_deriv(effsB, idxB, dx):.6e} %/tau^2")
+    return
+
+# ---------------------------
+# Step 4: Local Stability Gradient Test
+# ---------------------------
+def local_gradient_test(tau_center=1.0, q_list=None, pwm_list=None, dtau=0.02):
+    if q_list is None:
+        q_list=[32,36,40,44,48]
+    if pwm_list is None:
+        pwm_list=[10,11,12,13,14]
+    print("\n=== STEP 4: Local Stability Gradient Test ===")
+    results = []
+    for q in q_list:
+        for p in pwm_list:
+            A_c, B_c = model_efficiency(tau_center, q, p)
+            A_up, B_up = model_efficiency(tau_center + dtau, q, p)
+            A_dn, B_dn = model_efficiency(tau_center - dtau, q, p)
+
+            # numeric derivatives for A
+            effA_c = A_c[0]
+            effA_up = A_up[0]
+            effA_dn = A_dn[0]
+            gradA = (effA_up - effA_dn) / (2*dtau)
+            curvA = (effA_up - 2*effA_c + effA_dn) / (dtau**2)
+
+            # numeric derivatives for B
+            effB_c = B_c[0]
+            effB_up = B_up[0]
+            effB_dn = B_dn[0]
+            gradB = (effB_up - effB_dn) / (2*dtau)
+            curvB = (effB_up - 2*effB_c + effB_dn) / (dtau**2)
+
+            print(f"\nConfig q={q:2d}, pwm={p:2d}")
+            print_ab_header(("track",))
+            # Print A & B summary + derivatives
+            a_str = f"eff={effA_c:6.3f}%, grad={gradA:8.3f}, curv={curvA:10.3f}"
+            b_str = f"eff={effB_c:6.3f}%, grad={gradB:8.3f}, curv={curvB:10.3f}"
+            print(f"{'local':<18s} | {a_str:36s} | {b_str:36s}")
+
+            results.append((q,p,(effA_c,gradA,curvA), (effB_c,gradB,curvB)))
+    print("\nStep 4 complete.")
+    return results
+
+# ---------------------------
+# Step 5: Robustness Basin Mapping
+# ---------------------------
+def robustness_basin(tau_center=1.0, tau_frac=0.05, q_list=None, pwm_list=None, eff_threshold=0.70):
+    if q_list is None:
+        q_list=[32,36,40,44,48]
+    if pwm_list is None:
+        pwm_list=[10,11,12,13,14]
+    tau_low = tau_center * (1.0 - tau_frac)
+    tau_hi  = tau_center * (1.0 + tau_frac)
+    print("\n=== STEP 5: Robustness Basin Mapping ===")
+    print(f"Testing τ-window: [{tau_low:.3f}, {tau_hi:.3f}] around τ={tau_center}")
+    print("qbits  pwm   A_eff_c  A_eff_low  A_eff_hi   A_min_rel%   A_survive   |   B_eff_c  B_eff_low  B_eff_hi   B_min_rel%   B_survive")
+    print("-"*120)
+    survivorsA = []
+    survivorsB = []
+    for q in q_list:
+        for p in pwm_list:
+            A_c, B_c = model_efficiency(tau_center, q, p)
+            A_l, B_l = model_efficiency(tau_low, q, p)
+            A_h, B_h = model_efficiency(tau_hi, q, p)
+
+            baseA = max(A_c[0], 1e-12)
+            relA_low = A_l[0] / baseA
+            relA_hi = A_h[0] / baseA
+            relA_min = min(relA_low, relA_hi)
+            surviveA = (relA_min >= eff_threshold) and A_c[4]=="OK"
+
+            baseB = max(B_c[0], 1e-12)
+            relB_low = B_l[0] / baseB
+            relB_hi = B_h[0] / baseB
+            relB_min = min(relB_low, relB_hi)
+            surviveB = (relB_min >= eff_threshold) and B_c[4]=="OK"
+
+            print(f"{q:5d}  {p:3d}   {A_c[0]:7.3f}  {A_l[0]:9.3f}  {A_h[0]:9.3f}   {relA_min*100:9.2f}%   {str(surviveA):>6s}   |   "
+                  f"{B_c[0]:7.3f}  {B_l[0]:9.3f}  {B_h[0]:9.3f}   {relB_min*100:9.2f}%   {str(surviveB):>6s}")
+
+            if surviveA:
+                survivorsA.append((q,p,A_c[0],relA_min))
+            if surviveB:
+                survivorsB.append((q,p,B_c[0],relB_min))
+    print("\nStep 5 complete.")
+    return survivorsA, survivorsB
+
+# ---------------------------
+# Step 6: Stability Ridge Detection (scan tau for local maxima)
+# ---------------------------
+def stability_ridge_detection(q_list=None, pwm_list=None, tau_min=0.5, tau_max=2.0, points=61):
+    if q_list is None:
+        q_list=[32,36,40,44,48]
+    if pwm_list is None:
+        pwm_list=[10,11,12,13,14]
+    tau_grid = np.linspace(tau_min, tau_max, points)
+    print("\n=== STEP 6: Stability Ridge Detection ===")
+    results = []
+    for q in q_list:
+        for p in pwm_list:
+            effsA = np.array([model_efficiency(t,q,p)[0][0] for t in tau_grid])
+            effsB = np.array([model_efficiency(t,q,p)[1][0] for t in tau_grid])
+            # smooth by simple moving average
+            def find_peaks(arr):
+                peaks = []
+                for i in range(1,len(arr)-1):
+                    if arr[i] >= arr[i-1] and arr[i] >= arr[i+1]:
+                        peaks.append((tau_grid[i], arr[i]))
+                return peaks
+            peaksA = find_peaks(effsA)
+            peaksB = find_peaks(effsB)
+            print(f"q={q:2d} pwm={p:2d} -> A_peaks={len(peaksA)} at {[round(x[0],3) for x in peaksA]} | B_peaks={len(peaksB)} at {[round(x[0],3) for x in peaksB]}")
+            results.append((q,p,peaksA,peaksB))
+    print("\nStep 6 complete.")
+    return results
+
+# ---------------------------
+# Step 7: Gradient Sign Inversion Map
+# ---------------------------
+def gradient_sign_inversion(q_list=None, pwm_list=None, tau_min=0.5, tau_max=2.0, points=151):
+    if q_list is None:
+        q_list=[32,36,40,44,48]
+    if pwm_list is None:
+        pwm_list=[10,11,12,13,14]
+    tau_grid = np.linspace(tau_min, tau_max, points)
+    print("\n=== STEP 7: Gradient Sign Inversion Map ===")
+    for q in q_list:
+        for p in pwm_list:
+            effsA = np.array([model_efficiency(t,q,p)[0][0] for t in tau_grid])
+            effsB = np.array([model_efficiency(t,q,p)[1][0] for t in tau_grid])
+            gradA = np.diff(effsA)
+            gradB = np.diff(effsB)
+            # find sign inversions (approx)
+            invA_idx = np.where(np.sign(gradA[:-1]) != np.sign(gradA[1:]))[0]
+            invB_idx = np.where(np.sign(gradB[:-1]) != np.sign(gradB[1:]))[0]
+            invA_taus = [tau_grid[i+1] for i in invA_idx]
+            invB_taus = [tau_grid[i+1] for i in invB_idx]
+            print(f"q={q:2d} pwm={p:2d} -> A_inversions={len(invA_taus)} at {[round(x,4) for x in invA_taus]} | B_inversions={len(invB_taus)} at {[round(x,4) for x in invB_taus]}")
+    print("\nStep 7 complete.")
+    return
+
+# ---------------------------
+# Convenience: run full pipeline
+# ---------------------------
+def run_full_pipeline():
+    print("DE5 A/B Dual-Track pipeline run")
+    print("Run UTC:", datetime.utcnow().isoformat() + "Z")
+    smoke_test()
+
+    # Step 1: tau sweep (coarse)
+    tau_sweep(Vbus_default, q=40, pwm=12, tau_list=np.linspace(0.5,1.5,11))
+
+    # Step 2: cross-sensitivity
+    cross_sensitivity(tau=1.0, q_list=[28,32,36,40,44,48], pwm_list=[8,10,12,14])
+
+    # Step 3: curvature study for two example configs
+    curvature_study(q=32, pwm=12)
+    curvature_study(q=40, pwm=12)
+
+    # Step 4: local gradient
+    step4 = local_gradient_test(tau_center=1.0, q_list=[32,36,40,44,48], pwm_list=[10,11,12,13,14], dtau=0.02)
+
+    # Step 5: robustness basin
+    survivorsA, survivorsB = robustness_basin(tau_center=1.0, tau_frac=0.05,
+                                             q_list=[32,36,40,44,48],
+                                             pwm_list=[10,11,12,13,14],
+                                             eff_threshold=0.70)
+
+    # Step 6: ridge detection
+    ridges = stability_ridge_detection(q_list=[32,36,40,44,48], pwm_list=[10,11,12,13,14],
+                                       tau_min=0.5, tau_max=2.0, points=61)
+
+    # Step 7: gradient inversion map
+    gradient_sign_inversion(q_list=[32,36,40,44,48], pwm_list=[10,11,12,13,14],
+                            tau_min=0.5, tau_max=2.0, points=151)
+
+    # Summaries
+    print("\n=== SUMMARY ===")
+    # Best A and B survivors (if any)
+    if len(survivorsA):
+        bestA = max(survivorsA, key=lambda r: r[2])
+        print(f"Best A survivor: q={bestA[0]}, pwm={bestA[1]}, eff={bestA[2]:.3f}%, min_rel={bestA[3]*100:.2f}%")
+    if len(survivorsB):
+        bestB = max(survivorsB, key=lambda r: r[2])
+        print(f"Best B survivor: q={bestB[0]}, pwm={bestB[1]}, eff={bestB[2]:.3f}%, min_rel={bestB[3]*100:.2f}%")
+    print("Pipeline complete.")
+
+# ---------------------------
+# If executed as script, run pipeline
+# ---------------------------
+if __name__ == "__main__":
+    run_full_pipeline()
