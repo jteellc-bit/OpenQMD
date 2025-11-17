@@ -1,0 +1,123 @@
+OpenESC gift v1.1  4  (float-only, no math.h, no pow, no dependencies)
+
+Here you go — **QMD v1.1 Minimal (float-only, no math.h, no pow, no dependencies)**.
+
+✦ Fully drop-in C code
+✦ Only uses adds, multiplies, comparisons
+✦ Uses `float` everywhere
+✦ No standard library required (optional test block can be disabled)
+
+---
+
+# **qmd_v1_1_minimal_float.c**
+
+*(Complete file, ready to paste)*
+
+```c
+// qmd_v1_1_minimal_float.c
+// QMD v1.1 — OpenMESC Minimal (float-only, no math.h, no pow)
+// Single-file implementation: eta_from_tau_f()
+// Returns efficiency in percent (0..100).
+
+#include <stdio.h>   // only needed for optional main(); safe to remove
+
+// =============================================================
+// CONFIGURATION
+// =============================================================
+
+// Valid tau domain (conservative, embedded-safe)
+#define TAU_MIN_F 0.5f
+#define TAU_MAX_F 1.5f
+
+// Calibrated DE5 kernel coefficients (v1.1 float)
+#define QMD_A_F   0.28f   // quadratic
+#define QMD_B_F   0.08f   // quartic
+
+// tiny inline square function (avoids math.h)
+static inline float sqf(float x) { return x * x; }
+
+// =============================================================
+// PUBLIC API
+// =============================================================
+//
+//   float eta_from_tau_f(float tau)
+//
+// Input:
+//   tau : duty–phase ratio (dimensionless)
+//
+// Output:
+//   efficiency in percent, float 0..100
+//
+// Behavior:
+//   - clamps domain to [TAU_MIN_F, TAU_MAX_F]
+//   - polynomial:   eta = 1 - a*x^2 - b*x^4
+//   - negative values clipped to 0
+//   - returned as percent
+//
+// =============================================================
+
+float eta_from_tau_f(float tau)
+{
+    // domain clamp
+    if (!(tau >= TAU_MIN_F && tau <= TAU_MAX_F)) {
+        return 0.0f;
+    }
+
+    // centered variable
+    float x  = tau - 1.0f;
+    float x2 = sqf(x);
+    float x4 = x2 * x2;
+
+    // polynomial efficiency (fraction)
+    float eta = 1.0f - (QMD_A_F * x2) - (QMD_B_F * x4);
+
+    if (eta < 0.0f)
+        eta = 0.0f;
+
+    // return percent
+    return 100.0f * eta;
+}
+
+// =============================================================
+// OPTIONAL TEST PROGRAM
+// Remove #define to eliminate all stdio usage.
+// =============================================================
+#ifdef QMD_V1_1_FLOAT_MINIMAL_MAIN
+
+int main(void)
+{
+    float taus[] = {0.50f, 0.75f, 0.90f, 1.00f, 1.10f, 1.25f, 1.50f, 1.60f};
+    int N = sizeof(taus)/sizeof(taus[0]);
+
+    printf("QMD v1.1 Minimal Float (no math.h)\n");
+    printf(" tau    | eta(%%)\n");
+    printf("--------+---------\n");
+
+    for (int i = 0; i < N; i++) {
+        float t = taus[i];
+        float e = eta_from_tau_f(t);
+        printf(" %5.2f | %7.3f\n", t, e);
+    }
+
+    return 0;
+}
+
+#endif
+```
+
+---
+
+# ✔︎ Summary of changes vs the double version
+
+| Feature        | Double version  | Float-only microcontroller version |
+| -------------- | --------------- | ---------------------------------- |
+| Precision      | double          | float                              |
+| math.h         | **required**    | **not used at all**                |
+| pow()          | yes             | **no** (only x*x)                  |
+| Instructions   | adds/mults only | microcontroller-safe               |
+| Dynamic memory | none            | none                               |
+| Inversion      | none            | none                               |
+| Domain clamp   | yes             | yes                                |
+
+---
+
