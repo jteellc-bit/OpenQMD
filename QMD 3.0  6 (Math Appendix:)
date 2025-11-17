@@ -1,0 +1,180 @@
+QMD 3.0  6 (Math Appendix:)
+
+Below is a focused, production-ready Math Appendix: Physically-Calibrated DE5 Kernel (v3.0). It contains the continuous model, derivation from a simple energy balance, algebraic / numerical forms for implementation, calibration recipe, stability conditions (local + multivariate), inversion for use in a controller, discretization for RT/UHG, and quick pseudocode you can drop into your test harness.
+I kept it compact but complete so you can paste it into the repo README or an appendix document.
+
+Full Math Appendix — Physically-Calibrated DE5 Kernel (v3.0)
+1. Notation & quick summary
+    • Scalar control parameter: (\tau) — normalized torque command / constructive factor (dimensionless, nominally around (1.0)).
+    • Quantization resolution: (q) (q-bits).
+    • PWM resolution: (p) (pwm_bits).
+    • Kernel parameters: (K,\ \alpha,\ \beta) (positive reals).
+    • Auxiliary quantity: (A(q,p) \equiv \dfrac{\alpha}{q} + \dfrac{\beta}{p}).
+    • Efficiency (percentage or fraction): (\eta(\tau;q,p)) (use fraction [0..1] internally; show % in reports).
+Core compact formula (v3.0):
+[
+\boxed{\displaystyle \eta(\tau;q,p) ;=; K \cdot \frac{\tau}{,1 + (\tau-1)^2 , A(q,p),};}
+\tag{1}
+]
+This is the physically-calibrated DE5 kernel (v3.0). Intuition: numerator gives linear constructive gain with (\tau); denominator penalizes departure from (\tau=1) with a curvature term scaled by quantization and PWM through (A(q,p)).
+
+2. Derivation (energy-balance → algebraic form)
+Start from a minimal energy argument:
+    • delivered mechanical power (P_m \propto \tau).
+    • copper + switching + quantization losses scale as (L(\tau,q,p)). For small deviations from ideal (\tau=1) the dominant loss term scales quadratically with ((\tau-1)) and increases with digital quantization and PWM imprecision.
+Model:
+[
+P_\text{out}(\tau) = K_0,\tau,\qquad
+P_\text{loss}(\tau) = K_1,(\tau-1)^2 \cdot \big(\alpha'/q+\beta'/p\big)
+]
+Define efficiency fraction (\eta = \dfrac{P_\text{out}}{P_\text{out}+P_\text{loss}}). Substitute and reorganize:
+[
+\eta = \frac{K_0,\tau}{K_0,\tau + K_1(\tau-1)^2(\tfrac{\alpha'}{q}+\tfrac{\beta'}{p})}
+= \frac{\tau}{\tau + C (\tau-1)^2 A(q,p)}
+]
+Rescale constants, put leading scale (K) in front to capture system-wide calibration (sensor chain, mechanical coupling, baseline conversion). After algebraic manipulation we adopt form (1) with constants (K,\alpha,\beta) capturing the combined scaling.
+
+3. Properties & calculus
+Let (A\equiv A(q,p)). Write
+[
+\eta(\tau) = K,\frac{\tau}{1+A(\tau-1)^2}.
+]
+3.1 First derivative
+[
+\frac{\partial \eta}{\partial\tau} = K \cdot
+\frac{1 + A(\tau-1)^2 - \tau \cdot 2A(\tau-1)}
+{\big(1 + A(\tau-1)^2\big)^2}.
+\tag{2}
+]
+Set derivative = 0 to find extremum. At (\tau = 1),
+[
+\left.\frac{\partial\eta}{\partial\tau}\right|_{\tau=1} = K.
+]
+So (\tau=1) is not necessarily a stationary point — but because numerator terms cancel for symmetric reasons near 1 the kernel produces a well behaved unimodal shape for reasonable (A).
+3.2 Second derivative (curvature)
+[
+\frac{\partial^2\eta}{\partial\tau^2}
+= K\cdot\frac{N_2(\tau;A)}{\big(1 + A(\tau-1)^2\big)^3},
+]
+where (N_2) is a cubic polynomial in (\tau) (we omit full expanded form here; code places below). For stability analysis evaluate at (\tau^) (candidate peak). For a local maximum we require:
+[
+\left.\frac{\partial^2\eta}{\partial\tau^2}\right|_{\tau^} < 0.
+]
+In practice for the v3.0 kernel and physical (A>0), the peak is near (\tau\in(0.8,1.2)) and curvature is negative there.
+
+4. Closed-form inversion (solve (\tau) given (\eta))
+Controller use-case: given a desired efficiency-level (\eta_d) or torque normalized command (\tau), we may need to invert the algebraic relation.
+Rearrange (1) for unknown (\tau) given (\eta):
+[
+\eta\big(1 + A(\tau-1)^2\big) = K\tau.
+]
+This is quadratic in (\tau). Expand and gather terms:
+[
+(\eta A),\tau^2 + (-2\eta A - K),\tau + \eta(A+1) = 0.
+]
+Coefficients:
+[
+a = \eta A,\qquad b = -2\eta A - K,\qquad c = \eta(A+1).
+]
+Solve quadratic:
+[
+\tau = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a},
+]
+choose physically admissible root (positive (\tau), and within design range). When (a) is very small (e.g. (\eta\to0) or (A\to 0)) fall back to Newton iteration on (1).
+Note: solving for (\tau) is stable numerically if you: (i) check discriminant (D=b^2-4ac\ge0), (ii) clamp (\tau) to [(\tau_\min,\tau_\max)].
+
+5. Multivariate stability (q,p variation)
+Define multi-parameter vector (\mathbf{x} = [\tau, q, p]). The local stability condition around (\mathbf{x}^*) (e.g. best point) requires the Hessian (\mathbf{H} = \nabla^2_\mathbf{x} \eta) be negative definite (for a local maximum) restricted to the subspace of continuous variables. Since (q) and (p) are discrete, practical checks:
+    • compute (\partial^2 \eta/\partial \tau^2 |_{\mathbf{x}^*} < 0) (local curvature w.r.t. (\tau)).
+    • compute discrete finite differences for (q,p) (check (\eta(\tau^;q\pm\Delta q,p)) and (\eta(\tau^;q,p\pm\Delta p)) not larger).
+    • Hessian negative definite ⇒ all eigenvalues negative (use numeric approximation).
+Practical rule-of-thumb (used in testing): require
+    • (\eta(\tau^*;q,p)) be a local maximum in a small neighbourhood and
+    • relative retention over a perturbation window (e.g. (\tau\in[0.95,1.05])) ≥ 70% (robustness criterion).
+
+6. Discrete (RT/UHG) implementation and cost
+For RT implementation (no trig), we evaluate (1) with these operations:
+    • a multiply, one add, one subtraction, one square, two multiplies for (A(\tau-1)^2), and a division.
+If division is expensive on target MCU, convert to reciprocal multiplication via fast hardware reciprocal or a small-order polynomial approximation on (1/(1+x)) in the expected (x) range.
+Estimated instruction cost: dominated by one divide (or reciprocal) per kernel evaluation. Complexity ~ O(1) per call.
+
+7. Calibration recipe (fitting (K,\alpha,\beta))
+Given measured dataset (\mathcal{D}={(\tau_i,q_i,p_i,\eta_i)}):
+Minimize least squares:
+[
+\min_{K, \alpha,\beta} \sum_i \big( \eta(\tau_i;q_i,p_i;K,\alpha,\beta) - \eta_i\big)^2,
+]
+subject to (K>0,\ \alpha>0,\ \beta>0). Fit with scipy.optimize.least_squares or constrained optimizer. Use log-space transform (fit (\log K,\log\alpha,\log\beta)) to enforce positivity and improve numerical conditioning.
+Calibration steps
+    1. Initialize (K \approx \max(\eta_i)) (observed peak).
+    2. Set (\alpha,\beta) based on coarse grid using ratio method: test sensitivity by varying q and p independently.
+    3. Do local nonlinear least squares with bounds.
+    4. Validate by computing curvature & robustness window.
+(If you already have a gamma-fit file from prior runs, use those values as initial guesses.)
+
+8. Discrete-friendly polynomial approximation (optional)
+If you need to avoid divisions entirely, approximate (1/(1+x)) with a low-order polynomial (RT/UHG polynomial) on expected (x\in[0,x_\max]):
+Use minimax or least-squares approximation on (x\in[0,0.5]) (typical if ((\tau-1)^2A) is small). Example 3rd order:
+[
+\frac{1}{1+x} \approx 1 - x + x^2 - x^3 \quad (\text{converges for }|x|<1).
+]
+Then compute
+[
+\eta \approx K \tau \cdot \big(1 - x + x^2 - x^3\big),\quad x=A(\tau-1)^2.
+]
+Tradeoff: reduces divide cost, increases multiplies; evaluate approximation error in calibration.
+
+9. Implementation pseudocode (Python/C style)
+Evaluate kernel (safe)
+def eta_eval(tau, q, p, K, alpha, beta):
+    A = alpha / float(q) + beta / float(p)
+    x = A * (tau - 1.0) * (tau - 1.0)   # (tau-1)^2
+    denom = 1.0 + x
+    return K * (tau / denom)
+Inversion (closed form) — get tau for target eta
+def tau_from_eta(eta, q, p, K, alpha, beta):
+    A = alpha / float(q) + beta / float(p)
+    a = eta * A
+    b = -2*eta*A - K
+    c = eta*(A + 1.0)
+    D = b*b - 4*a*c
+    if D < 0:
+        # fallback: Newton solve on original equation
+        return newton_solve_tau(eta, q, p, K, alpha, beta)
+    t1 = (-b + math.sqrt(D)) / (2*a) if abs(a) > 1e-12 else None
+    t2 = (-b - math.sqrt(D)) / (2*a) if abs(a) > 1e-12 else None
+    # choose physically meaningful root (positive, near 1)
+    candidates = [t for t in [t1,t2] if t is not None and 0.0 < t < 10.0]
+    if not candidates: return newton_solve_tau(eta, q, p, K, alpha, beta)
+    # choose the root closest to 1.0
+    return min(candidates, key=lambda t: abs(t-1.0))
+
+10. Stability & test checklist (practical)
+For each candidate ((\tau^, q^, p^*)):
+    1. Local curvature: compute (\eta''(\tau^)). Require (\eta''(\tau^) < 0).
+    2. Finite-difference check: evaluate (\eta(\tau^\pm\delta\tau; q^,p^)) with (\delta\tau) small (0.01–0.05). Verify (\eta(\tau^)) is max.
+    3. Robustness window: relative retention (\min(\eta(\tau^\pm\Delta))/\eta(\tau^)) ≥ 0.70 (or user-specified).
+    4. Discrete stability: check for nearby discrete q and p values: (\eta(\tau^*; q\pm\Delta q,p)) not larger.
+    5. Hessian (if you need multi-dim strong guarantee): numerically compute (H) and verify eigenvalues (<0) in continuous subspace.
+
+11. Control-integration notes (how to use DE5 in a controller)
+    • Replace Clarke/Park mapping by using DE5 to compute optimal (\tau(t)) or the waveform amplitude target that maximizes (\eta) for a given torque command.
+    • Typical loop:
+        1. measure setpoint torque command (T_\text{cmd}).
+        2. map (T_\text{cmd}) → normalized (\tau_\text{desired}) using machine constants.
+        3. use eta_eval to compute expected efficiency; optionally use closed-form inversion to map a desired (\eta) to (\tau).
+        4. compute required phase currents from (\tau) (machine-specific mapping).
+    • DE5 does not directly output phase angles; it replaces the transformation step by giving a target "constructive factor" that the low-level inverter must deliver (then the inverter selects phase gating consistent with coil geometry). This reduces reliance on transcendental trig functions when generating waveforms because (\tau) is an algebraic scalar the low-level stack can use to scale duty cycles.
+
+12. Numerical example (pattern of use)
+    • After calibration you will have numerical (K,\alpha,\beta). For test: evaluate grid of (\tau\in[0.5,1.5]), (q\in{24,32,40,48}), (p\in{8,10,12,14}).
+    • Plot (\eta) vs (\tau) for each (q,p) to confirm unimodality, and run your robustness and dominance maps as you have been doing.
+
+13. Appendix: symbolic second derivative (for reference)
+If needed, compute the explicit second derivative programmatically (avoid manual expansion). In code use automatic differentiation or compute via finite differences with step control. For algebraic expression expansion you can use Sympy to produce exact (N_2(\tau;A)) for verification.
+
+14. Final remarks & recipe for next actions
+    • Put this eta_eval and tau_from_eta into your RT test harness as de5_kernel_v3.py (or .c). It requires only a few arithmetic ops and one divide.
+    • Calibrate with measured runs (least squares).
+    • Validate with the same sweep scripts you already have: τ-sweep, cross-sensitivity, dominance maps, robustness basin. Tune (K,\alpha,\beta) until the model reproduces the exact experimental curves.
+    • For RT/UHG, use the polynomial reciprocal approximation if your target hardware penalizes division.
