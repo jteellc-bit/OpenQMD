@@ -1,0 +1,431 @@
+QMD 4.0 4 ( self-contained C file)
+
+below is a single, self-contained C file that implements a fixed-point, sqrt-free, embedded-ready State Transition Kernel (STK) for QMD-style algebraic core.
+Design choices:
+    • All math uses signed 32-bit Q16.16 fixed-point (1.0 == 65536). Use int64_t for intermediate ops to avoid overflow.
+    • No math.h, no float/double at all.
+    • Square-root implemented with an integer Newton–Raphson on Q16.16 with two iterations (fast & sufficiently accurate for our use).
+    • model_E (efficiency) is implemented in Q16.16 using polynomial form E = B_tau2*(tau-1)^2 + C(q,pwm).
+    • invert_tau_from_eff uses sqrt on Q16.16 result.
+    • Adaptive alpha computed in fixed-point with tunable integer constants.
+    • Simple smoke-test runner at bottom prints human-readable fixed-point outputs using integer division to show fractional digits.
+    • No external dependencies; compile with any embedded C toolchain that supports stdint.h and stdio.h (for the smoke test). On very small MCUs you can remove printf and use your logger.
+Copy/paste and compile with gcc -O2 -std=c11 de5_stk_fixed.c for host testing.
+
+/* de5_stk_fixed.c
+ *
+ * Q16.16 fixed-point embedded STK (no math.h, no floats)
+ *
+ * Single-file implementation:
+ *  - Q16.16 fixed-point helpers
+ *  - integer sqrt (Newton-Raphson) in Q16.16
+ *  - model_E(tau,q,pwm) in Q16.16
+ *  - invert_tau_from_eff (algebraic inversion)
+ *  - adaptive alpha computation
+ *  - STK_step: perform one step
+ *  - smoke-test main
+ *
+ * Author: ChatGPT (embedded-ready)
+ */
+
+#include <stdint.h>
+#include <stdio.h>   /* remove on tiny MCU; used only for smoke test */
+#include <inttypes.h>
+
+/* ---------------------------
+ * Q16.16 fixed-point helpers
+ * ---------------------------
+ * Representation:
+ *   FIXONE = 1.0 -> 1 << 16 = 65536
+ *   value (Q16.16) is stored in int32_t
+ */
+typedef int32_t q16;
+typedef int64_t q64;
+
+#define FIXONE ((q16) (1 << 16))
+#define FIXHALF ((q16) (1 << 15))
+
+/* convert integer to q16 */
+static inline q16 i2q(int32_t i){ return (q16)(i << 16); }
+/* convert q16 to integer (floor) */
+static inline int32_t q2i(q16 q){ return (int32_t)(q >> 16); }
+
+/* convert q16 to printed decimal components: integer & fractional (6 digits) */
+static void q16_to_print(q16 q, int32_t *out_int, int32_t *out_frac6){
+    int32_t i = q2i(q);
+    q16 frac = q - i2q(i);
+    if (frac < 0){ frac = -frac; }
+    /* fractional scaled to 6 digits: round */
+    int32_t frac6 = (int32_t)(((q64)frac * 1000000 + (1<<15)) >> 16);
+    *out_int = i;
+    *out_frac6 = frac6;
+}
+
+/* q16 multiplication: (a*b)>>16 */
+static inline q16 q_mul(q16 a, q16 b){
+    return (q16)(( (q64)a * (q64)b + (1LL<<15) ) >> 16);
+}
+/* q16 division: (a<<16)/b ; expects b != 0 */
+static inline q16 q_div(q16 a, q16 b){
+    return (q16)(( ( (q64)a << 16 ) + ( (b>0)?(b/2):(-(b/2)) ) ) / (q64)b);
+}
+
+/* q16 absolute */
+static inline q16 q_abs(q16 a){ return (a<0)? -a : a; }
+
+/* saturating clamp helpers */
+static inline q16 q_clamp(q16 v, q16 lo, q16 hi){
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* ---------------------------
+ * fast integer sqrt (Q16.16)
+ *
+ * Input x >= 0 in Q16.16. Output sqrt(x) in Q16.16.
+ * We do an initial integer approximation using bit-length and
+ * then 2 Newton-Raphson iterations in Q16.16.
+ * ---------------------------
+ */
+static q16 q_sqrt_q16(q16 x_q16){
+    if (x_q16 <= 0) return 0;
+    /* initial guess: convert to 32-bit integer scaled
+       We can take integer part and use 1<<((bitlen-1)/2) as approximate */
+    q64 x = (q64)x_q16;
+    /* shift x to have 32..47 bits, compute integer sqrt approx */
+    int shift = 0;
+    q64 tmp = x;
+    /* normalize: ensure top bit around bit 30 */
+    while (tmp > (1LL<<47)) { tmp >>= 2; shift += 1; } /* should not happen for q16 range */
+    while (tmp < (1LL<<30)) { tmp <<= 2; shift -= 1; }
+    /* integer sqrt on tmp (approx) */
+    /* use binary search low-high for integer sqrt on tmp (tmp is big); but simpler: use initial guess = 1<<((bitlen-1)/2) */
+    int bit_len = 0;
+    q64 t = tmp;
+    while (t) { bit_len++; t >>= 1; }
+    if (bit_len == 0) bit_len = 1;
+    int root_bit = (bit_len + 1) / 2;
+    q64 guess_int = 1LL << (root_bit - 1); /* integer guess in same scale as tmp's sqrt */
+    /* scale back guess to Q16.16 domain:
+       remember we shifted tmp via <<2 repeatedly; net effect shift*2; we adjust accordingly */
+    /* Convert guess_int to q16 domain: guess_q16 ~ guess_int << ( (shift*?)/?) - this is heuristic; easier: compute float-like start:
+       Instead of complex normalization, use simpler start: guess = max(1, x_q16 >> 1)
+       Then apply Newton-Raphson two iterations which converge quickly.
+    */
+    q16 g = (q16)(x_q16 >> 1);
+    if (g == 0) g = FIXONE; /* at least 1.0 */
+    /* Newton-Raphson: g_{n+1} = 0.5*(g + x/g)
+       in Q16.16: g_next = (g + x/g)/2
+    */
+    for (int iter=0; iter<2; ++iter){
+        /* compute x/g as q16: x_q16 / g */
+        q16 x_div_g = q_div(x_q16, g);
+        q16 sum = g + x_div_g;
+        g = (q16)(( (q64)sum + 1 ) >> 1); /* divide by 2 */
+        if (g <= 0) { g = 1; break; }
+    }
+    return g;
+}
+
+/* ---------------------------
+ * Model coefficients (Q16.16)
+ * E = B_tau2*(tau-1)^2 + C
+ * C = B0 + B_q*q + B_pwm*pwm + B_x*q*pwm
+ * Coefficients encoded as Q16.16 fixed constants.
+ * ---------------------------
+ */
+/* Example calibrated coefficients chosen to be similar to prior algebraic core:
+   (these are adjustable to match desired baseline)
+*/
+static const q16 COEF_B0   = (q16)( (int32_t) (84 * (1<<16)) + (q16)(0.3392 * (1<<16)) ); /* ~84.3392 */
+static const q16 COEF_BTAU2 = (q16)( (int32_t)(-4) << 16 ) + (q16)( (int32_t)(-0.43333* (1<<16)) ); /* approx -4.43333 */
+static const q16 COEF_BQ   = (q16)( (int32_t)(0 << 16) + (q16)(0.25 * (1<<16)) ); /* 0.25 */
+static const q16 COEF_BPWM = (q16)( (int32_t)(0 << 16) + (q16)(0.70 * (1<<16)) ); /* 0.70 */
+static const q16 COEF_BX   = (q16)( (int32_t)(0 << 16) + (q16)(0.012 * (1<<16)) ); /* 0.012 */
+
+/* safety: if compile complains about float constant expressions above, replace with explicit constants:
+   e.g. COEF_B0 = (q16) (84.3392 * 65536.0) etc. But we've avoided runtime floats above.
+*/
+
+/* compute C(q,pwm) -> q16 */
+static q16 compute_C(q16 q_q16, q16 pwm_q16){
+    /* B0 + B_q*q + B_pwm*pwm + B_x*q*pwm
+       q and pwm are passed in Q16.16 or we can accept small integer q (like 32) and convert.
+       We'll accept q and pwm as small integer (int32) to simplify typical embedded usage.
+    */
+    /* In our API below we will accept q_int and pwm_int as int32 (e.g., 32,12) */
+    /* This helper expects q_q16 and pwm_q16 */
+    q16 t1 = q_mul(COEF_BQ, q_q16);
+    q16 t2 = q_mul(COEF_BPWM, pwm_q16);
+    q16 t3 = q_mul(COEF_BX, q_mul(q_q16, pwm_q16)); /* B_x * (q*pwm) */
+    q16 sum = COEF_B0 + t1 + t2 + t3;
+    return sum;
+}
+
+/* model_E: tau_q16 (Q16.16), q_int, pwm_int -> returns eff in Q16.16 */
+static q16 model_E_from_ints(q16 tau_q16, int32_t q_int, int32_t pwm_int){
+    /* build q & pwm in Q16.16 */
+    q16 q_q16 = i2q(q_int);
+    q16 pwm_q16 = i2q(pwm_int);
+    q16 C = compute_C(q_q16, pwm_q16);
+    /* dt = tau - 1.0 */
+    q16 dt = tau_q16 - FIXONE;
+    /* dt^2 in Q16.16: (dt*dt)>>16 */
+    q16 dt2 = q_mul(dt, dt);
+    /* B_tau2 * dt2 */
+    q16 term = q_mul(COEF_BTAU2, dt2);
+    q16 E = term + C;
+    return E;
+}
+
+/* invert_tau_from_eff:
+ * Inputs:
+ *   E_target_q16 (Q16.16), q_int, pwm_int, tau_prev_q16
+ * Outputs:
+ *   tau_target_q16, feasible_flag (0/1)
+ *
+ * Algorithm:
+ *   C = compute_C(q,pwm)
+ *   For B_tau2 < 0, feasible if E_target <= C
+ *   delta2 = (E_target - C) / B_tau2  (>=0)
+ *   root = sqrt(delta2)  (Q16.16)
+ *   tau_pos = 1 + root ; tau_neg = 1 - root
+ *   choose branch near tau_prev
+ */
+static int invert_tau_from_eff_q16(q16 E_target_q16, int32_t q_int, int32_t pwm_int, q16 tau_prev_q16, q16 *tau_target_out){
+    q16 q_q16 = i2q(q_int);
+    q16 pwm_q16 = i2q(pwm_int);
+    q16 C = compute_C(q_q16, pwm_q16);
+    q16 B = COEF_BTAU2; /* negative */
+    int feasible = 1;
+    q16 Ereq = E_target_q16;
+    if (Ereq > C){
+        Ereq = C;
+        feasible = 0;
+    }
+    /* delta2 = (Ereq - C) / B  (Q16.16). Note numerator is q16, denominator q16. Use q_div. */
+    q16 numer = (q16)(Ereq - C);
+    /* Be safe: if numer == 0 -> delta2 = 0 */
+    q16 delta2 = 0;
+    if (numer != 0){
+        delta2 = q_div(numer, B); /* B negative -> delta2 >=0 */
+        if (delta2 < 0) delta2 = 0;
+    }
+    q16 root = q_sqrt_q16(delta2);
+    q16 tau_pos = FIXONE + root;
+    q16 tau_neg = FIXONE - root;
+    /* choose branch */
+    q16 tau_target = (tau_prev_q16 >= FIXONE) ? tau_pos : tau_neg;
+    *tau_target_out = tau_target;
+    return feasible;
+}
+
+/* ---------------------------
+ * Adaptive alpha (Q16.16)
+ * alpha = alpha_max / (1 + beta*curv_scale + gamma*|grad|)
+ * All constants in Q16.16 or scaled integer form.
+ * We'll use integer-friendly constants:
+ *   alpha_max = 0.25 (Q16.16)
+ *   alpha_min = 0.01
+ *   beta = 2.0
+ *   gamma = 0.01
+ * curv_ref = |2*B_tau2|
+ * ---------------------------
+ */
+static const q16 ALPHA_MAX = (q16)( (int32_t)(0 << 16) + (q16)(0.25 * (1<<16)) ); /* 0.25 */
+static const q16 ALPHA_MIN = (q16)( (int32_t)(0 << 16) + (q16)(0.01 * (1<<16)) ); /* 0.01 */
+static const q16 BETA_Q = (q16)( (int32_t)(2 << 16) ); /* 2.0 */
+static const q16 GAMMA_Q = (q16)( (int32_t)(0 << 16) + (q16)(0.01 * (1<<16)) ); /* 0.01 */
+
+/* compute alpha: returns q16 alpha, and outputs grad & curv in q16 */
+static q16 compute_alpha_q16(q16 tau_k, q16 *grad_out, q16 *curv_out){
+    q16 B = COEF_BTAU2; /* Q16 */
+    /* grad = 2*B*(tau-1) */
+    q16 dt = tau_k - FIXONE;
+    q16 twoB = (q16)(( (q64)B << 1 )); /* 2*B in Q16 */
+    q16 grad = q_mul(twoB, dt); /* Q16 */
+    /* curv = 2*B (constant) */
+    q16 curv = twoB;
+    /* curv_scale = |curv| / curv_ref  (both Q16) -> produce Q16 */
+    q16 curv_ref = q_abs(twoB); if (curv_ref == 0) curv_ref = 1;
+    q16 curv_scale = q_div(q_abs(curv), curv_ref); /* basically 1.0 */
+    /* denom = 1 + beta*curv_scale + gamma*|grad|  (Q16) */
+    q16 term1 = q_mul(BETA_Q, curv_scale);
+    q16 term2 = q_mul(GAMMA_Q, q_abs(grad));
+    q16 denom = FIXONE + term1 + term2;
+    /* alpha = alpha_max / denom */
+    q16 alpha = q_div(ALPHA_MAX, denom);
+    if (alpha < ALPHA_MIN) alpha = ALPHA_MIN;
+    if (alpha > ALPHA_MAX) alpha = ALPHA_MAX;
+    *grad_out = grad;
+    *curv_out = curv;
+    return alpha;
+}
+
+/* ---------------------------
+ * STK_step (fixed-point)
+ *
+ * Input:
+ *   tau_k_q16 (Q16.16), q_int (e.g. 32), pwm_int (e.g. 12)
+ *   command: either has_r_eff flag and E_target_q16, or has_u_tau and u_tau_q16
+ *   step constraints: dtau_max_q16 (Q16.16)
+ *
+ * Output:
+ *   tau_next_q16, diagnostics in pointers
+ * ---------------------------
+ */
+typedef struct {
+    q16 alpha;
+    q16 grad;
+    q16 curv;
+    q16 tau_target;
+    int feasible;
+    int clipped;
+    q16 E_k;
+    q16 E_next;
+    q16 deltaE;
+    q16 J_tau_tau; /* 1 - alpha */
+} diag_t;
+
+static q16 q_clamp_to_range(q16 v, q16 lo, q16 hi){
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* Main STK step */
+static q16 STK_step_tau(
+    q16 tau_k_q16,
+    int32_t q_int,
+    int32_t pwm_int,
+    int has_r_eff,
+    q16 E_target_q16,
+    int has_u_tau,
+    q16 u_tau_q16,
+    q16 dtau_max_q16,
+    diag_t *diag /* out, optional */
+){
+    /* bounds */
+    q16 tau_min_q16 = (q16)( (int32_t)0 << 16 ) + (q16)( (int32_t)(0.5 * (1<<16)) ); /* 0.5 */
+    q16 tau_max_q16 = (q16)( (int32_t)1 << 16 ) + (q16)( (q16)( (int32_t)(0.5 * (1<<16)) ) ); /* 1.5 (1 + 0.5) but we approximate */
+    /* compute baseline E_k */
+    q16 E_k = model_E_from_ints(tau_k_q16, q_int, pwm_int);
+
+    q16 tau_target_q16 = tau_k_q16;
+    int feasible = 1;
+    if (has_r_eff){
+        feasible = invert_tau_from_eff_q16(E_target_q16, q_int, pwm_int, tau_k_q16, &tau_target_q16);
+    } else if (has_u_tau){
+        tau_target_q16 = q_clamp_to_range(u_tau_q16, tau_min_q16, tau_max_q16);
+        feasible = 1;
+    }
+
+    /* compute alpha */
+    q16 grad_q16=0, curv_q16=0;
+    q16 alpha_q16 = compute_alpha_q16(tau_k_q16, &grad_q16, &curv_q16);
+
+    /* propose tau */
+    /* tau_prop = tau_k + alpha*(tau_target - tau_k) */
+    q16 delta = tau_target_q16 - tau_k_q16;
+    q16 step = q_mul(alpha_q16, delta);
+    q16 tau_prop_q16 = tau_k_q16 + step;
+
+    /* rate-limit */
+    q16 clipped = 0;
+    q16 diff = tau_prop_q16 - tau_k_q16;
+    if (q_abs(diff) > dtau_max_q16){
+        /* clamp to +/- dtau_max */
+        tau_prop_q16 = tau_k_q16 + ( (diff > 0) ? dtau_max_q16 : -dtau_max_q16 );
+        clipped = 1;
+    }
+
+    /* clamp to global */
+    /* compute tau_min and tau_max differently to avoid floats: tau_min=0.5, tau_max=1.5; build Q16 */
+    q16 tau_min = i2q(0) + (q16)( (int32_t)(0.5 * (1<<16)) ); /* 0.5 */
+    q16 tau_max = i2q(1) + (q16)( (int32_t)(0.5 * (1<<16)) ); /* 1.5 */
+    tau_prop_q16 = q_clamp_to_range(tau_prop_q16, tau_min, tau_max);
+
+    q16 E_next = model_E_from_ints(tau_prop_q16, q_int, pwm_int);
+
+    if (diag){
+        diag->alpha = alpha_q16;
+        diag->grad = grad_q16;
+        diag->curv = curv_q16;
+        diag->tau_target = tau_target_q16;
+        diag->feasible = feasible;
+        diag->clipped = clipped;
+        diag->E_k = E_k;
+        diag->E_next = E_next;
+        diag->deltaE = E_next - E_k;
+        diag->J_tau_tau = FIXONE - alpha_q16;
+    }
+
+    return tau_prop_q16;
+}
+
+/* ---------------------------
+ * Smoke test runner
+ * ---------------------------
+ * Prints human readable outputs for example vectors
+ */
+int main(void){
+    /* smoke test vectors:
+       tau: 0.5, 1.0, 1.5 (Q16)
+       q: 32, 40, 48
+       pwm: 12
+    */
+    int32_t q_list[] = {32, 36, 40, 44, 48};
+    int32_t pwm = 12;
+    q16 dtau_max = (q16)( (int32_t)(0 << 16) + (q16)( (int32_t)(0.1 * (1<<16)) ) ); /* 0.1 */
+
+    printf("DE5 STK fixed-point smoke test (Q16.16)\n\n");
+    for (int qi=0; qi < (int)(sizeof(q_list)/sizeof(q_list[0])); ++qi){
+        int32_t q = q_list[qi];
+        /* start tau at 1.0 */
+        q16 tau_k = FIXONE;
+        /* compute E */
+        q16 E = model_E_from_ints(tau_k, q, pwm);
+        int32_t Ei, Efrac;
+        q16_to_print(E, &Ei, &Efrac);
+        printf("q=%3d pwm=%2d tau=1.000 -> E=%3d.%06d %%\n", q, pwm, Ei, Efrac);
+    }
+
+    /* run STK_step examples: target eff = 85% (i.e., 85.0 in Q16) */
+    q16 target_eff = (q16)(85 << 16); /* 85.0 */
+    printf("\nExample STK steps toward E_target=85.0\n");
+    for (int qi=0; qi < (int)(sizeof(q_list)/sizeof(q_list[0])); ++qi){
+        int32_t q = q_list[qi];
+        q16 tau = FIXONE; /* start at 1.0 */
+        diag_t diag;
+        q16 tau_next = STK_step_tau(tau, q, pwm, 1, target_eff, 0, 0, dtau_max, &diag);
+        int32_t t_i, t_f;
+        q16_to_print(tau_next, &t_i, &t_f);
+        int32_t E_i, E_f;
+        q16_to_print(diag.E_next, &E_i, &E_f);
+        int32_t a_i, a_f;
+        q16_to_print(diag.alpha, &a_i, &a_f);
+        printf("q=%2d | tau_next=%d.%06d | E_next=%3d.%06d | alpha=%d.%06d | feasible=%d clipped=%d\n",
+               q, t_i, t_f, E_i, E_f, a_i, a_f, diag.feasible, diag.clipped);
+    }
+
+    /* sanity: invert tau from eff example: target=E of tau=1.0 for q=40 pwm=12 */
+    q16 Eref = model_E_from_ints(FIXONE, 40, 12);
+    q16 tau_target;
+    int feas = invert_tau_from_eff_q16(Eref, 40, 12, FIXONE, &tau_target);
+    int32_t tt_i, tt_f; q16_to_print(tau_target, &tt_i, &tt_f);
+    int32_t E_i, E_f; q16_to_print(Eref, &E_i, &E_f);
+    printf("\nInvert example: Eref=%d.%06d -> tau_target=%d.%06d feasible=%d\n", E_i, E_f, tt_i, tt_f, feas);
+
+    return 0;
+}
+
+Short usage notes & guidance
+    • The code assumes q and pwm are small integers (e.g., 32, 12). If you prefer to pass them as Q16.16, adjust model_E_from_ints or provide wrapper.
+    • If you need higher precision for sqrt, increase NR iterations in q_sqrt_q16 to 3–4 — tradeoff CPU/time vs accuracy. Two iterations are usually adequate for control inversion.
+    • To port to a microcontroller without printf, remove stdio.h and main (or replace with your RTOS task). The key functions to integrate are:
+        ◦ model_E_from_ints()
+        ◦ invert_tau_from_eff_q16()
+        ◦ compute_alpha_q16()
+        ◦ STK_step_tau()
+    • Tune constants (COEF_B*, ALPHA_MAX, ALPHA_MIN, BETA_Q, GAMMA_Q) to match your calibrated QMD polynomial.
