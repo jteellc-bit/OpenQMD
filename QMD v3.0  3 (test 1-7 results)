@@ -1,0 +1,318 @@
+QMD v3.0  3 (test 1-7 results)
+
+
+DE5 A/B Dual-Track pipeline run
+Run UTC: 2025-11-17T02:18:39.548095Z
+Smoke test of model_efficiency (A | B):
+ example: tau=1.0, q=40, pwm=12  ->  A=(84.3392, 1500, 48.0, 23.04, 'OK')  |  B=(85.986274, 150000, 47.960117, 23.001728, 'OK')
+ example: tau=0.5, q=32, pwm=8  ->  A=(70.495, 1500, 45.0, 20.25, 'OK')  |  B=(71.602461, 150000, 44.560111, 19.856035, 'OK')
+ example: tau=1.0, q=32, pwm=12  ->  A=(79.28, 1500, 60.0, 36.0, 'OK')  |  B=(80.672699, 150000, 59.536341, 35.445759, 'OK')
+
+
+=== STEP 1: τ Sweep ===
+tau                |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+tau=0.500          | eff=77.185%, ns=   1500, Irms=24.000A, Pcu= 5.760W, OK | eff=77.920%, ns= 150000, Irms=23.868A, Pcu= 5.697W, OK
+tau=0.600          | eff=78.634%, ns=   1500, Irms=28.800A, Pcu= 8.294W, OK | eff=79.694%, ns= 150000, Irms=28.666A, Pcu= 8.218W, OK
+tau=0.700          | eff=80.074%, ns=   1500, Irms=33.600A, Pcu=11.290W, OK | eff=81.417%, ns= 150000, Irms=33.474A, Pcu=11.205W, OK
+tau=0.800          | eff=81.505%, ns=   1500, Irms=38.400A, Pcu=14.746W, OK | eff=83.073%, ns= 150000, Irms=38.293A, Pcu=14.663W, OK
+tau=0.900          | eff=82.927%, ns=   1500, Irms=43.200A, Pcu=18.662W, OK | eff=84.636%, ns= 150000, Irms=43.121A, Pcu=18.594W, OK
+tau=1.000          | eff=84.339%, ns=   1500, Irms=48.000A, Pcu=23.040W, OK | eff=85.986%, ns= 150000, Irms=47.960A, Pcu=23.002W, OK
+tau=1.100          | eff=82.742%, ns=   1500, Irms=52.800A, Pcu=27.878W, OK | eff=84.471%, ns= 150000, Irms=52.809A, Pcu=27.888W, OK
+tau=1.200          | eff=81.136%, ns=   1500, Irms=57.600A, Pcu=33.178W, OK | eff=82.743%, ns= 150000, Irms=57.667A, Pcu=33.255W, OK
+tau=1.300          | eff=79.521%, ns=   1500, Irms=62.400A, Pcu=38.938W, OK | eff=80.921%, ns= 150000, Irms=62.534A, Pcu=39.105W, OK
+tau=1.400          | eff=77.897%, ns=   1500, Irms=67.200A, Pcu=45.158W, OK | eff=79.033%, ns= 150000, Irms=67.409A, Pcu=45.440W, OK
+tau=1.500          | eff=76.263%, ns=   1500, Irms=72.000A, Pcu=51.840W, OK | eff=77.093%, ns= 150000, Irms=72.291A, Pcu=52.261W, OK
+
+Best (A): tau=1.000 eff=84.339%
+Best (B): tau=1.000 eff=85.986%
+
+=== STEP 2: Cross-Sensitivity Sweep ===
+
+ qbits = 28
+pwm                |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+pwm=8              | eff=73.884%, ns=   1500, Irms=102.857A, Pcu=105.796W, OK | eff=75.913%, ns= 150000, Irms=101.835A, Pcu=103.704W, OK
+pwm=10             | eff=75.446%, ns=   1500, Irms=82.286A, Pcu=67.709W, OK | eff=77.109%, ns= 150000, Irms=81.466A, Pcu=66.367W, OK
+pwm=12             | eff=76.660%, ns=   1500, Irms=68.571A, Pcu=47.020W, OK | eff=78.020%, ns= 150000, Irms=67.914A, Pcu=46.123W, OK
+pwm=14             | eff=77.709%, ns=   1500, Irms=58.776A, Pcu=34.546W, OK | eff=78.817%, ns= 150000, Irms=58.256A, Pcu=33.938W, OK
+
+ qbits = 32
+pwm                |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+pwm=8              | eff=76.780%, ns=   1500, Irms=90.000A, Pcu=81.000W, OK | eff=78.746%, ns= 150000, Irms=89.137A, Pcu=79.454W, OK
+pwm=10             | eff=78.163%, ns=   1500, Irms=72.000A, Pcu=51.840W, OK | eff=79.810%, ns= 150000, Irms=71.364A, Pcu=50.928W, OK
+pwm=12             | eff=79.280%, ns=   1500, Irms=60.000A, Pcu=36.000W, OK | eff=80.673%, ns= 150000, Irms=59.536A, Pcu=35.446W, OK
+pwm=14             | eff=80.271%, ns=   1500, Irms=51.429A, Pcu=26.449W, OK | eff=81.464%, ns= 150000, Irms=51.104A, Pcu=26.116W, OK
+
+ qbits = 36
+pwm                |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+pwm=8              | eff=79.520%, ns=   1500, Irms=80.000A, Pcu=64.000W, OK | eff=81.471%, ns= 150000, Irms=79.382A, Pcu=63.015W, OK
+pwm=10             | eff=80.781%, ns=   1500, Irms=64.000A, Pcu=40.960W, OK | eff=82.467%, ns= 150000, Irms=63.596A, Pcu=40.444W, OK
+pwm=12             | eff=81.831%, ns=   1500, Irms=53.333A, Pcu=28.444W, OK | eff=83.318%, ns= 150000, Irms=53.086A, Pcu=28.181W, OK
+pwm=14             | eff=82.782%, ns=   1500, Irms=45.714A, Pcu=20.898W, OK | eff=84.126%, ns= 150000, Irms=45.587A, Pcu=20.781W, OK
+
+ qbits = 40
+pwm                |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+pwm=8              | eff=82.163%, ns=   1500, Irms=72.000A, Pcu=51.840W, OK | eff=84.156%, ns= 150000, Irms=71.665A, Pcu=51.359W, OK
+pwm=10             | eff=83.336%, ns=   1500, Irms=57.600A, Pcu=33.178W, OK | eff=85.124%, ns= 150000, Irms=57.439A, Pcu=32.992W, OK
+pwm=12             | eff=84.339%, ns=   1500, Irms=48.000A, Pcu=23.040W, OK | eff=85.986%, ns= 150000, Irms=47.960A, Pcu=23.002W, OK
+pwm=14             | eff=85.261%, ns=   1500, Irms=41.143A, Pcu=16.927W, OK | eff=86.823%, ns= 150000, Irms=41.191A, Pcu=16.967W, OK
+
+ qbits = 44
+pwm                |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+pwm=8              | eff=84.743%, ns=   1500, Irms=65.455A, Pcu=42.843W, OK | eff=86.842%, ns= 150000, Irms=65.400A, Pcu=42.772W, OK
+pwm=10             | eff=85.852%, ns=   1500, Irms=52.364A, Pcu=27.420W, OK | eff=87.807%, ns= 150000, Irms=52.425A, Pcu=27.483W, OK
+pwm=12             | eff=86.819%, ns=   1500, Irms=43.636A, Pcu=19.041W, OK | eff=88.693%, ns= 150000, Irms=43.772A, Pcu=19.160W, OK
+pwm=14             | eff=87.720%, ns=   1500, Irms=37.403A, Pcu=13.990W, OK | eff=89.563%, ns= 150000, Irms=37.587A, Pcu=14.128W, OK
+
+ qbits = 48
+pwm                |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+pwm=8              | eff=87.280%, ns=   1500, Irms=60.000A, Pcu=36.000W, OK | eff=89.553%, ns= 150000, Irms=60.187A, Pcu=36.225W, OK
+pwm=10             | eff=88.339%, ns=   1500, Irms=48.000A, Pcu=23.040W, OK | eff=90.529%, ns= 150000, Irms=48.237A, Pcu=23.268W, OK
+pwm=12             | eff=89.280%, ns=   1500, Irms=40.000A, Pcu=16.000W, OK | eff=91.442%, ns= 150000, Irms=40.263A, Pcu=16.211W, OK
+pwm=14             | eff=90.165%, ns=   1500, Irms=34.286A, Pcu=11.755W, OK | eff=92.344%, ns= 150000, Irms=34.558A, Pcu=11.942W, OK
+
+=== STEP 3: Efficiency Curvature Study ===
+Config q=32, pwm=12
+ Algebraic peak: tau=1.000, eff=79.280%
+ Physics   peak: tau=1.000, eff=80.673%
+ Algebraic curvature @peak ≈ -6.014400e+02 %/tau^2
+ Physics curvature   @peak ≈ -5.347636e+02 %/tau^2
+
+=== STEP 3: Efficiency Curvature Study ===
+Config q=40, pwm=12
+ Algebraic peak: tau=1.000, eff=84.339%
+ Physics   peak: tau=1.000, eff=85.986%
+ Algebraic curvature @peak ≈ -6.009216e+02 %/tau^2
+ Physics curvature   @peak ≈ -5.342792e+02 %/tau^2
+
+=== STEP 4: Local Stability Gradient Test ===
+
+Config q=32, pwm=10
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=78.163%, grad=  -2.074, curv= -1502.075 | eff=79.810%, grad=  -2.121, curv= -1218.978
+
+Config q=32, pwm=11
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=78.743%, grad=  -1.714, curv= -1501.712 | eff=80.256%, grad=  -1.768, curv= -1218.645
+
+Config q=32, pwm=12
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=79.280%, grad=  -1.440, curv= -1501.440 | eff=80.673%, grad=  -1.487, curv= -1218.385
+
+Config q=32, pwm=13
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=79.787%, grad=  -1.227, curv= -1501.227 | eff=81.073%, grad=  -1.257, curv= -1218.185
+
+Config q=32, pwm=14
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=80.271%, grad=  -1.058, curv= -1501.055 | eff=81.464%, grad=  -1.063, curv= -1218.022
+
+Config q=36, pwm=10
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=80.781%, grad=  -1.638, curv= -1501.640 | eff=82.467%, grad=  -1.656, curv= -1218.572
+
+Config q=36, pwm=11
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=81.323%, grad=  -1.354, curv= -1501.355 | eff=82.902%, grad=  -1.361, curv= -1218.303
+
+Config q=36, pwm=12
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=81.831%, grad=  -1.138, curv= -1501.138 | eff=83.318%, grad=  -1.123, curv= -1218.102
+
+Config q=36, pwm=13
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=82.315%, grad=  -0.969, curv= -1500.967 | eff=83.724%, grad=  -0.927, curv= -1217.942
+
+Config q=36, pwm=14
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=82.782%, grad=  -0.836, curv= -1500.838 | eff=84.126%, grad=  -0.760, curv= -1217.815
+
+Config q=40, pwm=10
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=83.336%, grad=  -1.327, curv= -1501.328 | eff=85.124%, grad=  -1.283, curv= -1218.280
+
+Config q=40, pwm=11
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=83.852%, grad=  -1.097, curv= -1501.097 | eff=85.562%, grad=  -1.030, curv= -1218.060
+
+Config q=40, pwm=12
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=84.339%, grad=  -0.922, curv= -1500.920 | eff=85.986%, grad=  -0.825, curv= -1217.903
+
+Config q=40, pwm=13
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=84.807%, grad=  -0.785, curv= -1500.788 | eff=86.405%, grad=  -0.655, curv= -1217.775
+
+Config q=40, pwm=14
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=85.261%, grad=  -0.677, curv= -1500.675 | eff=86.823%, grad=  -0.511, curv= -1217.680
+
+Config q=44, pwm=10
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=85.852%, grad=  -1.097, curv= -1501.097 | eff=87.807%, grad=  -0.972, curv= -1218.070
+
+Config q=44, pwm=11
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=86.347%, grad=  -0.906, curv= -1500.907 | eff=88.254%, grad=  -0.753, curv= -1217.893
+
+Config q=44, pwm=12
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=86.819%, grad=  -0.762, curv= -1500.765 | eff=88.693%, grad=  -0.575, curv= -1217.763
+
+Config q=44, pwm=13
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=87.276%, grad=  -0.649, curv= -1500.650 | eff=89.128%, grad=  -0.428, curv= -1217.663
+
+Config q=44, pwm=14
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=87.720%, grad=  -0.560, curv= -1500.557 | eff=89.563%, grad=  -0.305, curv= -1217.590
+
+Config q=48, pwm=10
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=88.339%, grad=  -0.922, curv= -1500.920 | eff=90.529%, grad=  -0.709, curv= -1217.910
+
+Config q=48, pwm=11
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=88.819%, grad=  -0.762, curv= -1500.765 | eff=90.989%, grad=  -0.519, curv= -1217.770
+
+Config q=48, pwm=12
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=89.280%, grad=  -0.640, curv= -1500.640 | eff=91.442%, grad=  -0.366, curv= -1217.668
+
+Config q=48, pwm=13
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=89.727%, grad=  -0.545, curv= -1500.543 | eff=91.893%, grad=  -0.241, curv= -1217.593
+
+Config q=48, pwm=14
+track              |               A (alg)                |               B (phys)              
+-------------------+--------------------------------------+-------------------------------------
+local              | eff=90.165%, grad=  -0.470, curv= -1500.470 | eff=92.344%, grad=  -0.138, curv= -1217.540
+
+Step 4 complete.
+
+=== STEP 5: Robustness Basin Mapping ===
+Testing τ-window: [0.950, 1.050] around τ=1.0
+qbits  pwm   A_eff_c  A_eff_low  A_eff_hi   A_min_rel%   A_survive   |   B_eff_c  B_eff_low  B_eff_hi   B_min_rel%   B_survive
+------------------------------------------------------------------------------------------------------------------------
+   32   10    78.163     77.514     77.307       98.90%     True   |    79.810     79.247     79.035       99.03%     True
+   32   11    78.743     78.077     77.905       98.94%     True   |    80.256     79.676     79.499       99.06%     True
+   32   12    79.280     78.600     78.456       98.96%     True   |    80.673     80.079     79.930       99.08%     True
+   32   13    79.787     79.096     78.974       98.98%     True   |    81.073     80.467     80.342       99.10%     True
+   32   14    80.271     79.573     79.467       99.00%     True   |    81.464     80.849     80.743       99.11%     True
+   36   10    80.781     80.111     79.947       98.97%     True   |    82.467     81.881     81.716       99.09%     True
+   36   11    81.323     80.639     80.504       98.99%     True   |    82.902     82.302     82.166       99.11%     True
+   36   12    81.831     81.137     81.023       99.01%     True   |    83.318     82.706     82.594       99.13%     True
+   36   13    82.315     81.613     81.516       99.03%     True   |    83.724     83.102     83.010       99.15%     True
+   36   14    82.782     82.073     81.989       99.04%     True   |    84.126     83.496     83.420       99.16%     True
+   40   10    83.336     82.651     82.518       99.02%     True   |    85.124     84.520     84.392       99.14%     True
+   40   11    83.852     83.155     83.045       99.04%     True   |    85.562     84.945     84.842       99.16%     True
+   40   12    84.339     83.634     83.542       99.05%     True   |    85.986     85.360     85.277       99.18%     True
+   40   13    84.807     84.096     84.017       99.07%     True   |    86.405     85.770     85.705       99.19%     True
+   40   14    85.261     84.544     84.477       99.08%     True   |    86.823     86.181     86.130       99.20%     True
+   44   10    85.852     85.155     85.045       99.06%     True   |    87.807     87.188     87.090       99.18%     True
+   44   11    86.347     85.641     85.550       99.08%     True   |    88.254     87.624     87.549       99.20%     True
+   44   12    86.819     86.106     86.030       99.09%     True   |    88.693     88.054     87.996       99.21%     True
+   44   13    87.276     86.557     86.492       99.10%     True   |    89.128     88.481     88.439       99.23%     True
+   44   14    87.720     86.997     86.942       99.11%     True   |    89.563     88.910     88.880       99.24%     True
+   48   10    88.339     87.634     87.542       99.10%     True   |    90.529     89.897     89.826       99.22%     True
+   48   11    88.819     88.106     88.030       99.11%     True   |    90.989     90.347     90.296       99.24%     True
+   48   12    89.280     88.561     88.497       99.12%     True   |    91.442     90.793     90.757       99.25%     True
+   48   13    89.727     89.004     88.949       99.13%     True   |    91.893     91.238     91.214       99.26%     True
+   48   14    90.165     89.438     89.391       99.14%     True   |    92.344     91.683     91.669       99.27%     True
+
+Step 5 complete.
+
+=== STEP 6: Stability Ridge Detection ===
+q=32 pwm=10 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=32 pwm=11 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=32 pwm=12 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=32 pwm=13 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=32 pwm=14 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=36 pwm=10 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=36 pwm=11 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=36 pwm=12 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=36 pwm=13 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=36 pwm=14 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=40 pwm=10 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=40 pwm=11 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=40 pwm=12 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=40 pwm=13 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=40 pwm=14 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=44 pwm=10 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=44 pwm=11 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=44 pwm=12 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+/tmp/ipython-input-219665099.py:319: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  print("Run UTC:", datetime.utcnow().isoformat() + "Z")
+q=44 pwm=13 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=44 pwm=14 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=48 pwm=10 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=48 pwm=11 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=48 pwm=12 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=48 pwm=13 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+q=48 pwm=14 -> A_peaks=1 at [np.float64(1.0)] | B_peaks=1 at [np.float64(1.0)]
+
+Step 6 complete.
+
+=== STEP 7: Gradient Sign Inversion Map ===
+q=32 pwm=10 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=32 pwm=11 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=32 pwm=12 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=32 pwm=13 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=32 pwm=14 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=36 pwm=10 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=36 pwm=11 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=36 pwm=12 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=36 pwm=13 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=36 pwm=14 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=40 pwm=10 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=40 pwm=11 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=40 pwm=12 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=40 pwm=13 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=40 pwm=14 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=44 pwm=10 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=44 pwm=11 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=44 pwm=12 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=44 pwm=13 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=44 pwm=14 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=48 pwm=10 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=48 pwm=11 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=48 pwm=12 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=48 pwm=13 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+q=48 pwm=14 -> A_inversions=1 at [np.float64(1.0)] | B_inversions=1 at [np.float64(1.0)]
+
+Step 7 complete.
+
+=== SUMMARY ===
+Best A survivor: q=48, pwm=14, eff=90.165%, min_rel=99.14%
+Best B survivor: q=48, pwm=14, eff=92.344%, min_rel=99.27%
+Pipeline complete.
