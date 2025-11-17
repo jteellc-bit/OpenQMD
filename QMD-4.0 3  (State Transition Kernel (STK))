@@ -1,0 +1,332 @@
+QMD-4.0 3  (State Transition Kernel (STK))
+
+QMD-4.0 — State Transition Kernel (STK)
+Purpose: drive the QMD algebraic core (efficiency model) as a dynamical state machine that (a) accepts control targets and disturbances, (b) produces safe, stable transitions between operating points, and (c) provides diagnostics (stability score, Jacobian, step-size adaptation).
+Below: precise math, numerical forms, stability conditions, and runnable pseudocode (C-style / Python-style).
+
+1. Notation & primitives
+    • tau ∈ ℝ — torque-normalized state (primary axis; peak at 1.0).
+    • q ∈ ℝ⁺ — electrical loading index (discrete in practice but treated continuous here).
+    • pwm ∈ ℝ⁺ — PWM resolution / duty proxy.
+    • s = [tau, q, pwm] — state vector.
+    • eff(s) ≡ E(tau,q,pwm) — QMD-4.0 algebraic efficiency (see README coefficients).
+    • A = B_tau2 (negative), C(q,pwm) = B0 + B_q q + B_pwm pwm + B_x q·pwm. Then E = A·(tau−1)² + C.
+    • ∇_tau E = dE/dtau = 2 A (tau − 1)
+    • ∂²E/∂tau² = 2 A (constant; negative => concave in τ).
+Control inputs:
+    • r_eff — desired target efficiency (scalar) OR
+    • u_tau — direct target τ (open-loop)
+    • Δq, Δpwm — commanded changes (usually slow)
+Constraints / bounds:
+    • tau_min, tau_max (e.g. 0.5 .. 1.5)
+    • q_min, q_max (hardware)
+    • pwm_min, pwm_max
+
+2. Goal of STK
+Given current state s_k = [tau_k, q_k, pwm_k] and control input u_k (either r_eff or u_tau etc.), compute next state s_{k+1} that:
+    1. Moves toward the target smoothly (no overshoot).
+    2. Respects bounds and physical feasibility (no complex/infeasible inversion).
+    3. Adapts step size based on local curvature and gradient so the update is stable.
+    4. Produces diagnostics: Jacobian J = ∂s_{k+1}/∂s_k, stability score.
+We design STK as a one-step explicit, curvature-aware transition:
+tau_{k+1} = tau_k + α_k · (tau_target − tau_k)
+with α_k ∈ (0,1] chosen adaptively (see §4). q and pwm updated either commanded directly or with rate-limits.
+
+3. Algebraic inversion (tau_target)
+If control provides r_eff target:
+From E = A (tau − 1)² + C, solve for tau:
+    • rearrange: (tau − 1)² = (E − C) / A.
+Since A < 0, a physical target E must satisfy E ≤ C (because RHS = (E−C)/A ≥ 0). So first check feasibility:
+    • If E > C → infeasible (no τ real). Clamp E_clamped = min(E, C).
+Then:
+delta2 = (E_clamped - C) / A   # >= 0
+tau_pos = 1 + sqrt(delta2)
+tau_neg = 1 - sqrt(delta2)
+Which solution to pick? Use rule:
+    • If tau_k >= 1 choose tau_pos (stay on same side).
+    • Else choose tau_neg.
+(If you want τ on preferred side use explicit argument.)
+If control provides u_tau, then simply tau_target = clamp(u_tau, tau_min, tau_max).
+
+4. Adaptive step size α_k (curvature-aware)
+Naïve α = constant can overshoot when curvature high. We pick:
+grad = dE/dtau = 2 A (tau_k - 1)
+curv = d2E/dtau2 = 2 A      # constant negative
+
+# scale curvature magnitude to a ratio:
+curv_scale = min( max( |curv| / curv_ref, 0.0 ), curv_scale_max )
+
+# adaptive factor (smaller when curvature large or gradient steep):
+alpha_k = alpha_max / (1 + beta*curv_scale + gamma*|grad| )
+# then clamp: alpha_k = max(alpha_min, min(alpha_k, alpha_max))
+Recommended parameters (practical defaults):
+    • alpha_max = 0.5
+    • alpha_min = 0.01
+    • beta = 2.0
+    • gamma = 0.01
+    • curv_ref = |2*A_standard| (use model A magnitude)
+    • curv_scale_max = 100.0
+Rationale: when curvature magnitude or slope grows, reduce α to keep transition stable.
+
+5. Jacobian & stability test
+We can compute the linearized map for the tau component:
+tau_{k+1} = (1 - α_k)·tau_k + α_k·tau_target
+If tau_target is an algebraic function of C (depends on q,pwm), J_tau_tau = ∂tau_{k+1}/∂tau_k has two contributions:
+    1. from (1 - α_k) direct coefficient;
+    2. from α_k · ∂tau_target/∂tau_k implicit via C(q,pwm) dependence on q/pwm (usually none) and via E if target was an eff value depending on state — in standard usage target is external, so ∂tau_target/∂tau_k = 0.
+Thus for external r_eff:
+    • J_tau_tau ≈ 1 - α_k (spectral radius < 1 → stable)
+For self-referential control (e.g., r_eff derived from current E), compute derivative chain with implicit differentiation of inversion; it's safe for our algebraic case—still bounded if α_k ∈ (0,1).
+Stability criterion: ensure |1 - α_k| < 1 i.e. α_k ∈ (0,2). We enforce 0 < α_min ≤ α_k ≤ α_max ≤ 1 so this is trivially satisfied.
+
+6. Saturation, rate-limits, and projection
+Each component has:
+    • tau_{k+1} = clamp(tau_{k+1}, tau_min, tau_max)
+    • tau_rate_limit: enforce |tau_{k+1} − tau_k| ≤ Δtau_max
+    • similarly for q and pwm with Δq_max, Δpwm_max.
+If clipping occurs, notify via clipped=true diagnostic flag.
+
+7. Handling infeasible eff targets
+If control asks r_eff > C(q,pwm): (i.e., impossible given q/pwm)
+    • Option A: clamp r_eff to C−ε where ε small (e.g. 1e−6), then invert.
+    • Option B: return an error/feasibility flag to caller and compute closest feasible τ (minimizing |E−r_eff|). That is:
+# find tau* minimizing |E(tau,q,pwm) - r_eff|
+# equivalently, minimize |A (tau-1)^2 + C - r_eff|
+best_tau = 1.0   if (r_eff - C) <= 0
+best_tau = boundary (tau_min or tau_max) if r_eff > C
+Default: clamp r_eff to feasible max and continue — STK keeps moving but signals feasible=false.
+
+8. Algorithm (high-level)
+    1. Read s_k = [tau_k, q_k, pwm_k] and command u:
+        ◦ Either u = {'r_eff' : value} or u = {'u_tau' : value} or u = {'Δq', 'Δpwm'}.
+    2. Compute tau_target:
+        ◦ If u has r_eff: invert algebraically (clamp if necessary).
+        ◦ If u has u_tau: clamp to bounds.
+    3. Compute grad, curv at tau_k.
+    4. Compute α_k via adaptive rule.
+    5. Propose tau_{k+1} = tau_k + α_k*(tau_target − tau_k).
+    6. Enforce rate-limits and clamping.
+    7. Update q and pwm with rate-limits.
+    8. Compute diagnostics: Δeff = E(s_{k+1}) − E(s_k), J_diag = 1 − α_k, stability_score = |curv| / max(E(s_k), eps).
+    9. Return s_{k+1} and diagnostics.
+
+9. Pseudocode — Python style (readable, ready-to-run)
+import math
+
+# model coefficients (QMD-4.0 canonical)
+B0, B_tau2, B_q, B_pwm, B_x = 84.339, -4.43333, 0.25, 0.70, 0.012
+
+# bounds & parameters
+tau_min, tau_max = 0.5, 1.5
+alpha_max, alpha_min = 0.5, 0.01
+beta, gamma = 2.0, 0.01
+curv_ref = abs(2.0 * B_tau2)
+curv_scale_max = 100.0
+dtau_max = 0.1   # max tau change per step
+
+eps = 1e-9
+
+def E_of(tau, q, pwm):
+    C = B0 + B_q*q + B_pwm*pwm + B_x*q*pwm
+    return B_tau2 * (tau - 1.0)**2 + C
+
+def invert_tau_from_eff(E_target, q, pwm, tau_prev):
+    C = B0 + B_q*q + B_pwm*pwm + B_x*q*pwm
+    # feasible E must be <= C (since B_tau2<0)
+    if E_target > C:
+        # clamp to feasible maximum (or signal infeasible)
+        E_clamped = C
+        feasible = False
+    else:
+        E_clamped = E_target
+        feasible = True
+    delta2 = (E_clamped - C) / B_tau2  # >= 0
+    # numerical safety
+    delta2 = max(delta2, 0.0)
+    root = math.sqrt(delta2)
+    tau_pos = 1.0 + root
+    tau_neg = 1.0 - root
+    # choose branch near tau_prev
+    tau_target = tau_pos if tau_prev >= 1.0 else tau_neg
+    return tau_target, feasible
+
+def compute_alpha(tau_k):
+    grad = 2.0 * B_tau2 * (tau_k - 1.0)
+    curv = 2.0 * B_tau2
+    curv_scale = min(max(abs(curv) / curv_ref, 0.0), curv_scale_max)
+    alpha = alpha_max / (1.0 + beta*curv_scale + gamma*abs(grad))
+    alpha = max(alpha_min, min(alpha, alpha_max))
+    return alpha, grad, curv
+
+def STK_step(state, command):
+    # state: dict {tau,q,pwm}
+    tau_k, q_k, pwm_k = state['tau'], state['q'], state['pwm']
+    # determine target tau
+    if 'r_eff' in command:
+        tau_target, feasible = invert_tau_from_eff(command['r_eff'], q_k, pwm_k, tau_k)
+    elif 'u_tau' in command:
+        tau_target = max(tau_min, min(tau_max, command['u_tau']))
+        feasible = True
+    else:
+        tau_target = tau_k
+        feasible = True
+
+    # adaptive alpha
+    alpha, grad, curv = compute_alpha(tau_k)
+
+    # propose next tau
+    tau_prop = tau_k + alpha * (tau_target - tau_k)
+
+    # rate-limit
+    delta = tau_prop - tau_k
+    if abs(delta) > dtau_max:
+        tau_prop = tau_k + math.copysign(dtau_max, delta)
+        clipped = True
+    else:
+        clipped = False
+
+    # clamp
+    tau_next = max(tau_min, min(tau_max, tau_prop))
+
+    # optionally update q/pwm with simple rate-limits if present
+    q_next = state['q']
+    pwm_next = state['pwm']
+    if 'dq' in command:
+        q_next = max(0.0, q_next + command['dq'])  # add bounds as needed
+    if 'dpwm' in command:
+        pwm_next = max(0.0, pwm_next + command['dpwm'])
+
+    E_k = E_of(tau_k, q_k, pwm_k)
+    E_next = E_of(tau_next, q_next, pwm_next)
+
+    diag = {
+        'alpha': alpha,
+        'grad': grad,
+        'curv': curv,
+        'tau_target': tau_target,
+        'feasible': feasible,
+        'clipped': clipped,
+        'E_k': E_k,
+        'E_next': E_next,
+        'deltaE': E_next - E_k,
+        'J_tau_tau': 1.0 - alpha
+    }
+
+    return {'tau': tau_next, 'q': q_next, 'pwm': pwm_next}, diag
+
+10. Pseudocode — C style (embedded float-only)
+// float-only, no math.h if you provide a simple sqrtf implementation or
+// link to hardware sqrt. For clarity we assume sqrtf is available.
+
+typedef struct { float tau, q, pwm; } state_t;
+typedef struct {
+    float alpha, grad, curv, tau_target, E_k, E_next, deltaE;
+    int feasible, clipped;
+    float J_tau_tau;
+} diag_t;
+
+static inline float E_of(float tau, float q, float pwm) {
+    const float B0=84.339f, B_tau2=-4.43333f, B_q=0.25f, B_pwm=0.70f, B_x=0.012f;
+    float C = B0 + B_q*q + B_pwm*pwm + B_x*q*pwm;
+    float dt = tau - 1.0f;
+    return B_tau2 * dt*dt + C;
+}
+
+state_t STK_step_c(const state_t s, const float r_eff, const int has_r_eff, diag_t *out) {
+    const float tau_min=0.5f, tau_max=1.5f;
+    const float alpha_max=0.5f, alpha_min=0.01f, beta=2.0f, gamma=0.01f;
+    const float dtau_max=0.1f;
+    const float B_tau2 = -4.43333f;
+    const float curv_ref = fabsf(2.0f * B_tau2);
+
+    float tau_k = s.tau, q_k = s.q, pwm_k = s.pwm;
+    float tau_target = tau_k;
+    int feasible = 1;
+    if (has_r_eff) {
+        float C = 84.339f + 0.25f*q_k + 0.70f*pwm_k + 0.012f*q_k*pwm_k;
+        float Ereq = r_eff;
+        if (Ereq > C) { Ereq = C; feasible = 0; }
+        float delta2 = (Ereq - C) / B_tau2; if (delta2 < 0.0f) delta2 = 0.0f;
+        float root = sqrtf(delta2);
+        float tpos = 1.0f + root, tneg = 1.0f - root;
+        tau_target = (tau_k >= 1.0f) ? tpos : tneg;
+    }
+
+    float grad = 2.0f * B_tau2 * (tau_k - 1.0f);
+    float curv = 2.0f * B_tau2;
+    float curv_scale = fabsf(curv) / curv_ref;
+    if (curv_scale < 0.0f) curv_scale = 0.0f;
+    if (curv_scale > 100.0f) curv_scale = 100.0f;
+    float alpha = alpha_max / (1.0f + beta*curv_scale + gamma*fabsf(grad));
+    if (alpha < alpha_min) alpha = alpha_min;
+    if (alpha > alpha_max) alpha = alpha_max;
+
+    float tau_prop = tau_k + alpha * (tau_target - tau_k);
+    float delta = tau_prop - tau_k;
+    int clipped = 0;
+    if (fabsf(delta) > dtau_max) {
+        tau_prop = tau_k + (delta > 0 ? dtau_max : -dtau_max);
+        clipped = 1;
+    }
+    float tau_next = tau_prop;
+    if (tau_next < tau_min) { tau_next = tau_min; clipped = 1; }
+    if (tau_next > tau_max) { tau_next = tau_max; clipped = 1; }
+
+    float E_k = E_of(tau_k, q_k, pwm_k);
+    float E_next = E_of(tau_next, q_k, pwm_k);
+
+    if (out) {
+        out->alpha = alpha;
+        out->grad = grad;
+        out->curv = curv;
+        out->tau_target = tau_target;
+        out->feasible = feasible;
+        out->clipped = clipped;
+        out->E_k = E_k;
+        out->E_next = E_next;
+        out->deltaE = E_next - E_k;
+        out->J_tau_tau = 1.0f - alpha;
+    }
+
+    state_t s_next = { tau_next, q_k, pwm_k };
+    return s_next;
+}
+(If your microcontroller lacks sqrtf, provide a fast rational approximation or use hardware FPU.)
+
+11. Diagnostics & Metrics returned each step
+    • alpha — step fraction used.
+    • grad, curv — local slope & curvature at tau_k.
+    • tau_target, feasible — requested vs feasible.
+    • clipped — whether step-limits or bounds applied.
+    • E_k, E_next, deltaE — energy/eff change.
+    • J_tau_tau — linear coefficient (stability proxy).
+    • stability_index (optional) — |curv| / max(E_k, eps) (higher -> sharper ridge -> slower α).
+Interpretation: large |curv| and large |grad| → small alpha, slow changes, safer.
+
+12. Multi-variable control & coupling
+When q and pwm are commanded simultaneously, they change C(q,pwm). If r_eff is specified and depends on q/pwm, then tau_target will change strongly. STK handles it safely since α adapts to curvature and grad.
+If you want coordinated updates (e.g., change q in step0 and let tau follow in step1), use a two-phase command:
+    1. Apply dq/dpwm with small rate, keep r_eff unset; STK updates q/pwm.
+    2. In next step set r_eff to desired value — tau will move to new inversion.
+This avoids abrupt C jumps causing unstable inversion.
+
+13. Multi-kernel (A/B) comparison mode
+STK can be used to run two kernels in parallel:
+    • run STK_step with kernel A (algebraic) and kernel B (physics) using same commands,
+    • compare E_next_A vs E_next_B, diagnostics alpha_A vs alpha_B, J difference,
+    • If divergence > threshold, flag sync_issue and optionally reduce α or revert state to conservative kernel.
+
+14. Practical recommendations
+    • Use alpha_max ≈ 0.25..0.5 for human-scale adjustments; reduce for safety-critical loops.
+    • Use dtau_max ~ 0.05..0.1 per control tick depending on loop frequency. For 1 kHz control, dtau_max can be tiny (0.001).
+    • If memory-constrained, prefer the C variant; store only previous state + diag scalar.
+    • For embedded, provide a hardware sqrtf or rational approx; avoid heavy math libs.
+    • Expose feasible and clipped in control layer for adaptive re-planning.
+    • Run a quick “dry-run” with STK in simulation for any new q/pwm strategy to verify no clipping/infeasibility occurs.
+
+15. Quick example flow (textual)
+    • Controller wants eff=85%. Current s = tau=0.9, q=40, pwm=12.
+    • STK inverts: computes C and finds feasible. Computes tau_target (≈1.0+...).
+    • grad & curv computed → alpha ~ 0.2.
+    • tau moves 20% of the way to tau_target. E_next is measured/predicted and returned.
+    • Control loop reads diag; sees stable J≈0.8; continues next tick.
