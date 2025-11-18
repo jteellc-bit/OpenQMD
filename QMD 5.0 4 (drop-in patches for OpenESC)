@@ -1,0 +1,243 @@
+QMD 5.0 4 (drop-in patches for OpenESC)
+
+drop-in patches you can apply directly to an OpenESC checkout (or any ESC firmware repo).
+The patch set does three simple things:
+    1. Adds the QMD v5.0 kernel files (qmd5.h / qmd5.c) — pure C, no external deps, fixed-point Q12.20.
+    2. Adds a tiny integration wrapper (qmd5_integration.c) that exposes a convenient float API for any part of the codebase that still uses floats (optional).
+    3. Provides a Makefile/CMake snippet you can paste into your build files to compile the new files.
+Save the patch and apply with git apply qmd5_openesc.patch from your repo root (or manually copy the new files into the paths below). I used conservative file-paths so you can drop them into the usual OpenESC firmware tree and then add the sources to your build system.
+
+How to apply
+From your repo root:
+    1. Save the patch text below into a file, e.g. qmd5_openesc.patch.
+    2. Run:
+git apply qmd5_openesc.patch
+    3. Add the new source files to your build system:
+        ◦ If you use a Makefile, add src/qmd/qmd5.c and src/qmd/qmd5_integration.c to the SRCS list.
+        ◦ If you use CMake, add add_library(qmd5 src/qmd/qmd5.c src/qmd/qmd5_integration.c) or append the .c files to the existing target.
+    4. Rebuild the firmware. See usage examples below for integrating calls.
+
+What the patch contains
+    • src/qmd/qmd5.h — header public API
+    • src/qmd/qmd5.c — fixed-point Q12.20 kernel and derivative
+    • src/qmd/qmd5_integration.c — a tiny float wrapper + example qmd5_apply_to_tau() helper
+    • docs/qmd5_README.md — mini README with usage notes
+    • Makefile/CMake snippet (text in patch comments) — paste into your build system
+
+The patch (unified diff — create file qmd5_openesc.patch and apply)
+*** Begin Patch
+*** Add File: src/qmd/qmd5.h
++/*
++ * qmd5.h
++ * QMD v5.0 kernel - public header
++ *
++ * Fixed-point Q12.20 implementation of eta(tau) and analytic derivative.
++ * No external dependencies; safe for embedded builds (uses int64_t internally).
++ */
++#ifndef QMD5_H_
++#define QMD5_H_
++
++#include <stdint.h>
++
++/* Q12.20 fixed point */
++typedef int32_t q20_t;
++#define Q20_ONE (1 << 20)
++#define FLOAT_TO_Q20(x) ((q20_t)((x) * (float)(1<<20)))
++#define Q20_TO_FLOAT(x) ((float)(x) / (float)(1<<20))
++
++/* Public API */
++q20_t qmd5_eta(q20_t tau_fp);
++q20_t qmd5_eta_prime(q20_t tau_fp);
++
++/* convenience - peak tau in Q12.20 (== 1.0) */
++#define QMD5_TAU_PEAK_FP (1 << 20)
++
++#endif /* QMD5_H_ */
++
+*** End Patch
+*** Begin Patch
+*** Add File: src/qmd/qmd5.c
++/*
++ * qmd5.c
++ * QMD v5.0 kernel implementation
++ *
++ * Fixed-point (Q12.20) polynomial:
++ *   eta(tau) = C0 + C2*(tau-1)^2 + C4*(tau-1)^4
++ *
++ * Analytic derivative:
++ *   eta'(tau) = 2*C2*(tau-1) + 4*C4*(tau-1)^3
++ *
++ * All coefficients are stored in Q12.20 (q20_t). Intermediate multiply uses int64_t.
++ */
++
++#include "qmd5.h"
++#include <stdint.h>
++
++/* Final tuned coefficients (Q12.20) - do not change without refit */
++static const q20_t C0_fp =  575821;   /* ~0.5491458893884329 */
++static const q20_t C2_fp =  596139;   /* ~0.5685220545151792 */
++static const q20_t C4_fp = -253691;   /* ~-0.24193823095151684 */
++
++/* compute (tau-1) ^ 2 in Q12.20 */
++static inline q20_t qmd5_dx2(q20_t dx_fp)
++{
++    return (q20_t)(((int64_t)dx_fp * (int64_t)dx_fp) >> 20);
++}
++
++/* public: eta(tau) */
++q20_t qmd5_eta(q20_t tau_fp)
++{
++    /* dx = tau - 1 */
++    q20_t dx = tau_fp - Q20_ONE;
++    q20_t dx2 = qmd5_dx2(dx);
++    q20_t dx4 = (q20_t)(((int64_t)dx2 * (int64_t)dx2) >> 20);
++
++    /* compute C0 + C2*dx2 + C4*dx4  (all q20) */
++    int64_t term_c2 = ((int64_t)C2_fp * (int64_t)dx2) >> 20;
++    int64_t term_c4 = ((int64_t)C4_fp * (int64_t)dx4) >> 20;
++    int64_t res = (int64_t)C0_fp + term_c2 + term_c4;
++
++    return (q20_t)res;
++}
++
++/* public: analytic derivative eta'(tau) */
++q20_t qmd5_eta_prime(q20_t tau_fp)
++{
++    q20_t dx = tau_fp - Q20_ONE;
++
++    /* dx^3 = (dx^2)*dx >> 20 */
++    q20_t dx2 = qmd5_dx2(dx);
++    q20_t dx3 = (q20_t)(((int64_t)dx2 * (int64_t)dx) >> 20);
++
++    /* term1 = 2*C2*dx, term3 = 4*C4*dx^3  (both q20 after >>20) */
++    int64_t term1 = (((int64_t)2 * (int64_t)C2_fp) * (int64_t)dx) >> 20;
++    int64_t term3 = (((int64_t)4 * (int64_t)C4_fp) * (int64_t)dx3) >> 20;
++
++    int64_t res = term1 + term3;
++    return (q20_t)res;
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: src/qmd/qmd5_integration.c
++/*
++ * qmd5_integration.c
++ *
++ * Optional float wrapper for legacy parts of firmware that still use float.
++ * This file is safe to compile with -fno-math-errno and on systems with float.
++ *
++ * Exposes a simple function:
++ *   float qmd5_eta_float(float tau)
++ *   float qmd5_eta_prime_float(float tau)
++ *
++ * Internally converts to Q12.20, uses fixed-point kernel, returns float.
++ */
++
++#include "qmd5.h"
++#include <stdint.h>
++
++float qmd5_eta_float(float tau)
++{
++    /* clamp tau to [0.5 .. 1.5] recommended */
++    if (tau < 0.5f) tau = 0.5f;
++    if (tau > 1.5f) tau = 1.5f;
++
++    q20_t tau_fp = FLOAT_TO_Q20(tau);
++    q20_t eta_fp = qmd5_eta(tau_fp);
++    return Q20_TO_FLOAT(eta_fp);
++}
++
++float qmd5_eta_prime_float(float tau)
++{
++    if (tau < 0.5f) tau = 0.5f;
++    if (tau > 1.5f) tau = 1.5f;
++
++    q20_t tau_fp = FLOAT_TO_Q20(tau);
++    q20_t eprime_fp = qmd5_eta_prime(tau_fp);
++    return Q20_TO_FLOAT(eprime_fp);
++}
++
+*** End Patch
+*** Begin Patch
+*** Add File: docs/qmd5_README.md
++# QMD v5.0 — Drop-in for OpenESC
++
++This small package adds the QMD v5.0 algebraic kernel to your ESC firmware.
++
++Files added:
++
++- `src/qmd/qmd5.h` — Public API (Q12.20 typedefs, macros, prototypes)  
++- `src/qmd/qmd5.c` — Fixed-point implementation of eta(tau) and eta'(tau)  
++- `src/qmd/qmd5_integration.c` — Optional float wrapper functions for convenience  
++
++Build integration:
++
++- **Makefile**: append `src/qmd/qmd5.c` and `src/qmd/qmd5_integration.c` to your SRCS list  
++- **CMake**: add the two sources to your firmware target (or `add_library(qmd5 ...)`)  
++
++Usage:
++
++```c
++#include "qmd5.h"
++
++q20_t tau_fp = FLOAT_TO_Q20(1.0f);
++q20_t eta_fp = qmd5_eta(tau_fp);
++float eta = Q20_TO_FLOAT(eta_fp);
++
++// or, if you prefer floats:
++float eta_f = qmd5_eta_float(1.0f);
++```
++
++Notes:
++- Kernel is Q12.20 fixed-point. It uses int64_t internally for safe multiplies.  
++- Recommended tau range: [0.5, 1.5]. Clamp inputs in your control loop.  
++- Coefficients are final for QMD v5.0; if you want to re-fit, supply a baseline CSV and we will re-fit coefficients.
++
+*** End Patch
+
+Example integration snippet (copy into your control loop)
+Add this where you choose τ and want the corresponding η:
+#include "qmd5.h"
+
+/* inside your control/update routine */
+float tau = observer_get_tau();   // float tau in [0.5 .. 1.5]
+q20_t tau_fp = FLOAT_TO_Q20(tau);
+q20_t eta_fp  = qmd5_eta(tau_fp);
+q20_t etap_fp = qmd5_eta_prime(tau_fp);
+
+/* If your control uses floats only: */
+float eta_f  = Q20_TO_FLOAT(eta_fp);
+float etap_f = Q20_TO_FLOAT(etap_fp);
+
+/* now apply eta_f to modulation gains / lookups / whatever */
+
+Build system notes
+Makefile (example) — append to SRCS:
+SRCS += src/qmd/qmd5.c src/qmd/qmd5_integration.c
+CMake (example) — add to target:
+target_sources(your_firmware_target PRIVATE
+    src/qmd/qmd5.c
+    src/qmd/qmd5_integration.c
+)
+
+Quick verification test (recommended)
+Add a tiny debug print to run once at startup:
+#include "qmd5.h"
+#include <stdio.h>
+
+void qmd5_selftest(void)
+{
+    float tau = 1.0f;
+    float eta = qmd5_eta_float(tau);
+    float eprime = qmd5_eta_prime_float(tau);
+    printf("QMD5 selftest tau=%f eta=%f eta'=%f\n", tau, eta, eprime);
+}
+This will print the peak values (eta ≈ 0.5491459 for the current coeff set).
+
+Final notes / recommended next steps
+    • If you want, YOU can add...(not included).
+        ◦ produce a git branch-ready patch instead of the unified-diff (I can create a .patch file ready for git am),
+        ◦ add automated unit tests (C host-side tests comparing float reference vs fixed-point over sweep),
+        ◦ prepare a VESC/OpenESC PR with the build-system changes already applied, or
+        ◦ produce a binary/firmware diff that toggles QMD on/off at runtime for A/B testing.
+
