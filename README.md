@@ -56,6 +56,9 @@ When to use v3.0:
 Status:
 v3.0 is the current flagship model, superseding v2.0 in accuracy and structure while retaining backward compatibility.
 
+QMD-v4.0 is a deterministic, algebraic modeling pipeline that can fully describe a complex system using only a compact polynomial, a symmetry rule, and a lightweight state-transition kernel — all deployable on a float-only microcontroller.
+
 In progress...
-QMD-4.0 is a deterministic, algebraic modeling pipeline that can fully describe a complex system using only a compact polynomial, a symmetry rule, and a lightweight state-transition kernel — all deployable on a float-only microcontroller.
+
+QMD - v5.0 final working version
 
